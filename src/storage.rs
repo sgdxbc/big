@@ -4,6 +4,7 @@ use std::{
     sync::Arc,
 };
 
+use bincode::{Decode, Encode, config::standard};
 use bytes::Bytes;
 use primitive_types::H256;
 use rand::{Rng, SeedableRng, rngs::StdRng};
@@ -11,19 +12,23 @@ use rocksdb::{DB, WriteBatch};
 use tokio::{
     select,
     sync::{
-        mpsc::{Receiver, Sender},
+        mpsc::{Receiver, Sender, channel},
         oneshot,
     },
     task::JoinSet,
+    try_join,
 };
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use crate::NodeIndex;
+use crate::{NodeIndex, network::NetworkId};
+
+use self::message::Message;
 
 pub mod bench;
 pub mod plain;
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Encode, Decode)]
 pub struct StorageKey([u8; 32]);
 
 pub type StateVersion = u64;
@@ -71,11 +76,12 @@ impl StorageConfig {
     }
 }
 
-pub struct Storage {
+pub struct StorageCore {
     config: StorageConfig,
     node_indices: Vec<NodeIndex>,
     db: Arc<DB>,
 
+    cancel: CancellationToken,
     rx_op: Receiver<StorageOp>,
     rx_message: Receiver<Message>,
     tx_message: Sender<(SendTo, Message)>,
@@ -95,17 +101,48 @@ struct ActiveEntry {
     value: Option<Bytes>,
 }
 
-pub enum Message {
-    PushEntry(message::PushEntry),
-}
-
 pub enum SendTo {
     All,
     // individual?
 }
 
-impl Storage {
+impl StorageCore {
+    pub fn new(
+        config: StorageConfig,
+        node_indices: Vec<NodeIndex>,
+        db: Arc<DB>,
+        cancel: CancellationToken,
+        rx_op: Receiver<StorageOp>,
+        rx_message: Receiver<Message>,
+        tx_message: Sender<(SendTo, Message)>,
+    ) -> Self {
+        Self {
+            config,
+            node_indices,
+            db,
+            cancel,
+            rx_op,
+            rx_message,
+            tx_message,
+            version: 0,
+            active_state: Default::default(),
+            active_state_versions: Default::default(),
+            fetching_keys: Default::default(),
+            bumping: None,
+            get_tasks: JoinSet::new(),
+            write_tasks: JoinSet::new(),
+        }
+    }
+
     pub async fn run(&mut self) -> anyhow::Result<()> {
+        self.cancel
+            .clone()
+            .run_until_cancelled(self.run_inner())
+            .await
+            .unwrap_or(Ok(()))
+    }
+
+    async fn run_inner(&mut self) -> anyhow::Result<()> {
         loop {
             enum Event<GR, PR> {
                 Op(StorageOp),
@@ -150,6 +187,7 @@ impl Storage {
 
     fn handle_fetch(&mut self, key: StorageKey, tx_value: oneshot::Sender<Option<Bytes>>) {
         if let Some(entry) = self.active_state.get(&key) {
+            assert!(entry.version + self.config.active_push_ahead >= self.version);
             let _ = tx_value.send(entry.value.clone());
             return;
             // in this branch we don't need to push entry anyway. if the entry is among active
@@ -296,12 +334,137 @@ impl Storage {
     }
 }
 
-mod message {
+pub mod message {
+    use bincode::{Decode, Encode};
+
     use crate::storage::{StateVersion, StorageKey};
 
+    #[derive(Encode, Decode)]
+    pub enum Message {
+        PushEntry(PushEntry),
+    }
+
+    #[derive(Encode, Decode)]
     pub struct PushEntry {
         pub key: StorageKey,
         pub value: Option<Vec<u8>>,
         pub version: StateVersion,
+    }
+}
+
+pub struct Incoming {
+    cancel: CancellationToken,
+    rx_bytes: Receiver<(NetworkId, Bytes)>,
+    tx_message: Sender<Message>,
+}
+
+impl Incoming {
+    pub fn new(
+        cancel: CancellationToken,
+        rx_bytes: Receiver<(NetworkId, Bytes)>,
+        tx_message: Sender<Message>,
+    ) -> Self {
+        Self {
+            cancel,
+            rx_bytes,
+            tx_message,
+        }
+    }
+
+    pub async fn run(&mut self) -> anyhow::Result<()> {
+        while let Some(Some((_, bytes))) =
+            self.cancel.run_until_cancelled(self.rx_bytes.recv()).await
+        {
+            let (message, len) = bincode::decode_from_slice(&bytes, standard())?;
+            anyhow::ensure!(len == bytes.len());
+            let _ = self.tx_message.send(message).await;
+        }
+        Ok(())
+    }
+}
+
+pub struct Outgoing {
+    node_table: Vec<NetworkId>, // node index -> network id
+
+    cancel: CancellationToken,
+    rx_message: Receiver<(SendTo, Message)>,
+    tx_bytes: Sender<(NetworkId, Bytes)>,
+}
+
+impl Outgoing {
+    pub fn new(
+        node_table: Vec<NetworkId>,
+        cancel: CancellationToken,
+        rx_message: Receiver<(SendTo, Message)>,
+        tx_bytes: Sender<(NetworkId, Bytes)>,
+    ) -> Self {
+        Self {
+            node_table,
+            cancel,
+            rx_message,
+            tx_bytes,
+        }
+    }
+
+    pub async fn run(&mut self) -> anyhow::Result<()> {
+        while let Some(Some((send_to, message))) = self
+            .cancel
+            .run_until_cancelled(self.rx_message.recv())
+            .await
+        {
+            let bytes = Bytes::from(bincode::encode_to_vec(&message, standard())?);
+            match send_to {
+                SendTo::All => {
+                    for &network_id in &self.node_table {
+                        let _ = self.tx_bytes.send((network_id, bytes.clone())).await;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+pub struct Storage {
+    core: StorageCore,
+    incoming: Incoming,
+    outgoing: Outgoing,
+}
+
+impl Storage {
+    pub fn new(
+        config: StorageConfig,
+        node_indices: Vec<NodeIndex>,
+        node_table: Vec<NetworkId>,
+        db: Arc<DB>,
+        cancel: CancellationToken,
+        rx_op: Receiver<StorageOp>,
+        rx_incoming_bytes: Receiver<(NetworkId, Bytes)>,
+        tx_outgoing_bytes: Sender<(NetworkId, Bytes)>,
+    ) -> Self {
+        let (tx_incoming_message, rx_incoming_message) = channel(100);
+        let (tx_outgoing_message, rx_outgoing_message) = channel(100);
+
+        let core = StorageCore::new(
+            config,
+            node_indices,
+            db,
+            cancel.clone(),
+            rx_op,
+            rx_incoming_message,
+            tx_outgoing_message,
+        );
+        let incoming = Incoming::new(cancel.clone(), rx_incoming_bytes, tx_incoming_message);
+        let outgoing = Outgoing::new(node_table, cancel, rx_outgoing_message, tx_outgoing_bytes);
+        Self {
+            core,
+            incoming,
+            outgoing,
+        }
+    }
+
+    pub async fn run(&mut self) -> anyhow::Result<()> {
+        try_join!(self.core.run(), self.incoming.run(), self.outgoing.run())?;
+        Ok(())
     }
 }

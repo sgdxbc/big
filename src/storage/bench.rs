@@ -15,7 +15,9 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::{StorageKey, StorageOp, plain::Plain};
+use crate::NodeIndex;
+
+use super::{StorageCore, StorageConfig, StorageKey, StorageOp, plain::PlainStorage};
 
 pub struct BenchConfig {
     num_key: u64,
@@ -105,21 +107,60 @@ impl Bench {
     }
 }
 
-pub struct BenchPlain {
+pub struct BenchPlainStorage {
     bench: Bench,
-    plain: Plain,
+    plain_storage: PlainStorage,
 }
 
-impl BenchPlain {
+impl BenchPlainStorage {
     pub fn new(config: BenchConfig, db: Arc<DB>, cancel: CancellationToken) -> Self {
         let (tx_op, rx_op) = channel(1);
         let bench = Bench::new(config, cancel.clone(), tx_op);
-        let plain = Plain::new(db, cancel, rx_op);
-        Self { bench, plain }
+        let plain = PlainStorage::new(db, cancel, rx_op);
+        Self {
+            bench,
+            plain_storage: plain,
+        }
     }
 
     pub async fn run(&mut self) -> anyhow::Result<()> {
-        try_join!(self.plain.run(), self.bench.run())?;
+        try_join!(self.plain_storage.run(), self.bench.run())?;
+        Ok(())
+    }
+}
+
+pub struct BenchStorage {
+    bench: Bench,
+    storage: StorageCore,
+}
+
+impl BenchStorage {
+    pub fn new(
+        bench_config: BenchConfig,
+        storage_config: StorageConfig,
+        node_indices: Vec<NodeIndex>,
+        db: Arc<DB>,
+        cancel: CancellationToken,
+    ) -> Self {
+        let (tx_op, rx_op) = channel(1);
+        let (tx_incoming_message, rx_incoming_message) = channel(100);
+        let (tx_outgoing_message, rx_outgoing_message) = channel(100);
+
+        let bench = Bench::new(bench_config, cancel.clone(), tx_op);
+        let storage = StorageCore::new(
+            storage_config,
+            node_indices,
+            db,
+            cancel.clone(),
+            rx_op,
+            rx_incoming_message,
+            tx_outgoing_message,
+        );
+        Self { bench, storage }
+    }
+
+    pub async fn run(&mut self) -> anyhow::Result<()> {
+        try_join!(self.storage.run(), self.bench.run())?;
         Ok(())
     }
 }

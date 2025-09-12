@@ -3,8 +3,8 @@ use std::time::Duration;
 use big::{
     parse::Configs,
     storage::{
-        bench::{Bench, BenchPlain},
-        plain::Plain,
+        bench::{Bench, BenchPlainStorage},
+        plain::PlainStorage,
     },
 };
 use rand::{SeedableRng as _, rngs::StdRng};
@@ -26,14 +26,14 @@ bench.put-ratio 0.5
     let temp_dir = tempdir()?;
     println!("{}", temp_dir.path().display());
     let db = DB::open_default(temp_dir.path())?;
-    Plain::prefill(
+    PlainStorage::prefill(
         &db,
         Bench::prefill_items(configs.extract()?, StdRng::seed_from_u64(117418)),
     )?;
     println!("db prefilled");
 
     let cancel = CancellationToken::new();
-    let mut bench = BenchPlain::new(configs.extract()?, db.into(), cancel.clone());
+    let mut bench = BenchPlainStorage::new(configs.extract()?, db.into(), cancel.clone());
     let timeout = async {
         sleep(Duration::from_secs(1)).await;
         cancel.cancel();

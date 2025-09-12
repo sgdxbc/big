@@ -7,14 +7,14 @@ use tokio_util::sync::CancellationToken;
 
 use super::{StorageKey, StorageOp};
 
-pub struct Plain {
+pub struct PlainStorage {
     db: Arc<DB>,
 
     cancel: CancellationToken,
     rx_op: Receiver<StorageOp>,
 }
 
-impl Plain {
+impl PlainStorage {
     pub fn new(db: Arc<DB>, cancel: CancellationToken, rx_op: Receiver<StorageOp>) -> Self {
         Self { db, cancel, rx_op }
     }
