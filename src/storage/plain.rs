@@ -1,0 +1,52 @@
+use std::sync::Arc;
+
+use bytes::Bytes;
+use rocksdb::{DB, WriteBatch};
+use tokio::sync::mpsc::Receiver;
+use tokio_util::sync::CancellationToken;
+
+use super::StorageOp;
+
+pub struct Plain {
+    db: Arc<DB>,
+
+    cancel: CancellationToken,
+    rx_op: Receiver<StorageOp>,
+}
+
+impl Plain {
+    pub fn new(db: Arc<DB>, cancel: CancellationToken, rx_op: Receiver<StorageOp>) -> Self {
+        Self { db, cancel, rx_op }
+    }
+
+    pub async fn run(&mut self) -> anyhow::Result<()> {
+        self.cancel
+            .clone()
+            .run_until_cancelled(self.run_inner())
+            .await
+            .unwrap_or(Ok(()))
+    }
+
+    async fn run_inner(&mut self) -> anyhow::Result<()> {
+        while let Some(op) = self.rx_op.recv().await {
+            match op {
+                StorageOp::Fetch(key, tx_value) => {
+                    let value = self.db.get(key.0)?;
+                    let _ = tx_value.send(value.map(|v| Bytes::from(v)));
+                }
+                StorageOp::Bump(updates, tx_ok) => {
+                    let mut batch = WriteBatch::new();
+                    for (key, value) in updates {
+                        match value {
+                            Some(value) => batch.put(key.0, &value),
+                            None => batch.delete(key.0),
+                        }
+                    }
+                    self.db.write(batch)?;
+                    let _ = tx_ok.send(());
+                }
+            }
+        }
+        Ok(())
+    }
+}

@@ -1,0 +1,59 @@
+version: "0.2"
+ignorePaths: []
+dictionaryDefinitions: []
+dictionaries: []
+ignoreWords: []
+import: []
+words:
+  - addrs
+  - asonnino
+  - bftk
+  - bigbft
+  - CGGMP21
+  - ciphersuite
+  - Cowsay
+  - Demikernel
+  - Deque
+  - ed25519_dalek
+  - feistel
+  - Givre
+  - hdrhistogram
+  - hostnames
+  - hotstuff
+  - keccak
+  - libhotstuff
+  - nanos
+  - newtype
+  - newtypes
+  - Niko
+  - oneshot
+  - pbft
+  - permissioned
+  - permissionless
+  - pgrep
+  - Pkcs8
+  - pkill
+  - PODC
+  - prehashed
+  - proptest
+  - quantiles
+  - QUIC
+  - rcgen
+  - rngs
+  - rocksdb
+  - rsplit
+  - rustls
+  - secp
+  - Seedable
+  - seqs
+  - sidenote
+  - sidenotes
+  - Sonnino
+  - specpaxos
+  - thiserror
+  - tput
+  - txns
+  - unreplicated
+  - unsharded
+  - utxo
+  - Ycsb

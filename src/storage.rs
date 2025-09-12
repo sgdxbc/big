@@ -1,17 +1,21 @@
 use std::{
     cmp::Reverse,
     collections::{BinaryHeap, HashMap},
-    sync::mpsc::Sender,
+    sync::{Arc, mpsc::Sender},
 };
 
 use bytes::Bytes;
 use primitive_types::H256;
+use rocksdb::{DB, WriteBatch};
 use tokio::{
     select,
     sync::{mpsc::Receiver, oneshot},
     task::JoinSet,
 };
 use tracing::warn;
+
+pub mod bench;
+pub mod plain;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct StorageKey([u8; 32]);
@@ -30,7 +34,7 @@ impl StorageKey {
 
 pub enum StorageOp {
     Fetch(StorageKey, oneshot::Sender<Option<Bytes>>),
-    Bump(Vec<(StorageKey, Option<Bytes>)>),
+    Bump(Vec<(StorageKey, Option<Bytes>)>, oneshot::Sender<()>),
     // TODO prefetch
 }
 
@@ -45,6 +49,7 @@ pub struct StorageConfig {
 
 pub struct Storage {
     config: StorageConfig,
+    db: Arc<DB>,
 
     rx_op: Receiver<StorageOp>,
     rx_message: Receiver<Message>,
@@ -54,6 +59,7 @@ pub struct Storage {
     active_state: HashMap<StorageKey, ActiveEntry>,
     active_state_versions: BinaryHeap<Reverse<(StateVersion, StorageKey)>>,
     fetching_keys: HashMap<StorageKey, oneshot::Sender<Option<Bytes>>>,
+    bumping: Option<oneshot::Sender<()>>,
     bumping_keys: HashMap<StorageKey, Option<Bytes>>,
     get_tasks: JoinSet<anyhow::Result<(StorageKey, Option<Vec<u8>>)>>,
     put_tasks: JoinSet<anyhow::Result<()>>,
@@ -83,7 +89,7 @@ impl Storage {
                 Message(Message),
             }
             match select! {
-                Some(op) = self.rx_op.recv(), if !self.is_bumping() => Event::Op(op),
+                Some(op) = self.rx_op.recv() => Event::Op(op),
                 Some(result) = self.get_tasks.join_next() => Event::GetResult(result),
                 Some(message) = self.rx_message.recv() => Event::Message(message),
                 else => break,
@@ -99,14 +105,10 @@ impl Storage {
         Ok(())
     }
 
-    fn is_bumping(&self) -> bool {
-        !self.bumping_keys.is_empty() || !self.put_tasks.is_empty()
-    }
-
     fn handle_op(&mut self, op: StorageOp) {
         match op {
-            StorageOp::Fetch(storage_key, sender) => self.handle_fetch(storage_key, sender),
-            StorageOp::Bump(updates) => self.handle_bump(updates),
+            StorageOp::Fetch(storage_key, tx_value) => self.handle_fetch(storage_key, tx_value),
+            StorageOp::Bump(updates, tx_ok) => self.handle_bump(updates, tx_ok),
         }
     }
 
@@ -116,33 +118,61 @@ impl Storage {
         }
     }
 
-    fn handle_fetch(&mut self, key: StorageKey, sender: oneshot::Sender<Option<Bytes>>) {
+    fn handle_fetch(&mut self, key: StorageKey, tx_value: oneshot::Sender<Option<Bytes>>) {
         if let Some(entry) = self.active_state.get(&key) {
-            let _ = sender.send(entry.value.clone());
+            let _ = tx_value.send(entry.value.clone());
             return;
         }
 
-        self.fetching_keys.insert(key, sender);
-        // TODO spawn get task if stored locally
+        self.fetching_keys.insert(key, tx_value);
+        let db = self.db.clone();
+        self.get_tasks.spawn_blocking(move || {
+            let value = db.get(key.0)?;
+            Ok((key, value))
+        });
     }
 
-    fn handle_bump(&mut self, updates: Vec<(StorageKey, Option<Bytes>)>) {
+    fn handle_bump(
+        &mut self,
+        updates: Vec<(StorageKey, Option<Bytes>)>,
+        tx_ok: oneshot::Sender<()>,
+    ) {
         assert!(self.bumping_keys.is_empty());
         if !self.fetching_keys.is_empty() {
             warn!("bump while fetching not finished");
             self.fetching_keys.clear() // implicitly drop the result channels
         }
-        for (key, value) in updates {
+
+        self.version += 1;
+        self.bumping = Some(tx_ok);
+
+        for (key, value) in updates.clone() {
             if let Some(active_entry) = self.active_state.get(&key) {
                 let updated_entry = self.update_entry(key, value, active_entry.clone());
                 self.install_entry(key, updated_entry)
             } else {
                 self.bumping_keys.insert(key, value);
-                // TODO spawn get task if stored locally
+
+                let db = self.db.clone();
+                self.get_tasks.spawn_blocking(move || {
+                    let value = db.get(key.0)?;
+                    Ok((key, value))
+                });
             }
         }
 
-        // TODO spawn put task
+        let db = self.db.clone();
+        self.put_tasks.spawn_blocking(move || {
+            let mut batch = WriteBatch::new();
+            for (key, value) in updates {
+                match value {
+                    Some(value) => batch.put(key.0, value),
+                    None => batch.delete(key.0),
+                }
+            }
+            db.write(batch)?;
+            Ok(())
+        });
     }
 
     fn handle_get_result(&mut self, key: StorageKey, value: Option<Vec<u8>>) {
@@ -171,8 +201,8 @@ impl Storage {
     }
 
     fn install_entry(&mut self, key: StorageKey, mut entry: ActiveEntry) {
-        if let Some(sender) = self.fetching_keys.remove(&key) {
-            let _ = sender.send(entry.value.clone());
+        if let Some(tx_value) = self.fetching_keys.remove(&key) {
+            let _ = tx_value.send(entry.value.clone());
         }
 
         if let Some(value) = self.bumping_keys.remove(&key) {

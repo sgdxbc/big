@@ -1,5 +1,5 @@
 {
-    "cSpell.words": [
-        "oneshot"
-    ]
+    "explorer.sortOrder": "mixed",
+    "rust-analyzer.completion.addSemicolonToUnit": false,
+    "rust-analyzer.imports.prefix": "self",
 }
