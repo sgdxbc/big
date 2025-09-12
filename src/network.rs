@@ -5,7 +5,7 @@ use quinn::{Connection, ConnectionError};
 use tokio::{
     select,
     sync::mpsc::{Receiver, Sender},
-    task::{JoinError, JoinSet},
+    task::JoinSet,
 };
 use tracing::warn;
 
@@ -27,12 +27,12 @@ pub struct Network {
 impl Network {
     pub async fn run(&mut self) -> anyhow::Result<()> {
         loop {
-            enum Event {
+            enum Event<R> {
                 IncomingConnection(Connection),
                 OutgoingConnection((NetworkId, Connection)),
                 Close(NetworkId),
                 Message((NetworkId, Bytes)),
-                TaskResult(Result<anyhow::Result<()>, JoinError>),
+                TaskResult(R),
             }
             match select! {
                 Some(connection) = self.rx_incoming_connection.recv() => Event::IncomingConnection(connection),
