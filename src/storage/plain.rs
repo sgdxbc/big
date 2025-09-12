@@ -5,7 +5,7 @@ use rocksdb::{DB, WriteBatch};
 use tokio::sync::mpsc::Receiver;
 use tokio_util::sync::CancellationToken;
 
-use super::StorageOp;
+use super::{StorageKey, StorageOp};
 
 pub struct Plain {
     db: Arc<DB>,
@@ -47,6 +47,18 @@ impl Plain {
                 }
             }
         }
+        Ok(())
+    }
+
+    pub fn prefill(
+        db: &DB,
+        items: impl IntoIterator<Item = (StorageKey, Bytes)>,
+    ) -> anyhow::Result<()> {
+        let mut batch = WriteBatch::new();
+        for (key, value) in items {
+            batch.put(key.0, &value);
+        }
+        db.write(batch)?;
         Ok(())
     }
 }

@@ -64,7 +64,7 @@ impl Bench {
         let mut value = vec![0; 68];
         loop {
             let start;
-            let key = self.random_key();
+            let key = Self::uniform_key(self.rng.random_range(0..=self.config.num_key));
             if self.rng.random_bool(self.config.put_ratio) {
                 self.rng.fill(&mut value[..]);
                 let (tx_ok, rx_ok) = oneshot::channel();
@@ -88,8 +88,20 @@ impl Bench {
         }
     }
 
-    fn random_key(&mut self) -> StorageKey {
-        StorageKey(StdRng::seed_from_u64(self.rng.random_range(0..=self.config.num_key)).random())
+    fn uniform_key(index: u64) -> StorageKey {
+        StorageKey(StdRng::seed_from_u64(index).random())
+    }
+
+    pub fn prefill_items(
+        config: BenchConfig,
+        mut rng: StdRng,
+    ) -> impl Iterator<Item = (StorageKey, Bytes)> {
+        (0..config.num_key).map(move |i| {
+            let key = Self::uniform_key(i);
+            let mut value = vec![0; 68];
+            rng.fill(&mut value[..]);
+            (key, Bytes::from(value))
+        })
     }
 }
 
@@ -109,5 +121,20 @@ impl BenchPlain {
     pub async fn run(&mut self) -> anyhow::Result<()> {
         try_join!(self.plain.run(), self.bench.run())?;
         Ok(())
+    }
+}
+
+mod parse {
+    use crate::parse::Extract;
+
+    use super::BenchConfig;
+
+    impl Extract for BenchConfig {
+        fn extract(configs: &crate::parse::Configs) -> anyhow::Result<Self> {
+            Ok(Self {
+                num_key: configs.get("bench.num-key")?,
+                put_ratio: configs.get("bench.put-ratio")?,
+            })
+        }
     }
 }
