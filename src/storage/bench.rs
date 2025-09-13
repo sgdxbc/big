@@ -16,12 +16,9 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::{
-    NodeIndex,
-    network::{Mesh, Network, NetworkId},
-};
+use crate::network::{Mesh, Network, NetworkId};
 
-use super::{Storage, StorageConfig, StorageKey, StorageOp, plain::PlainStorage};
+use super::{NodeIndex, Storage, StorageConfig, StorageKey, StorageOp, plain::PlainStorage};
 
 pub struct BenchConfig {
     num_key: u64,

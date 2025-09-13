@@ -21,7 +21,7 @@ async fn main() -> anyhow::Result<()> {
     let mut configs = Configs::new();
     configs.parse(
         "
-bench.num-key   4000000
+bench.num-key   1000000
 bench.put-ratio 0.5
 
 big.num-node            4
@@ -42,9 +42,9 @@ addrs   127.0.0.1:5003
     for node_index in 0..configs.get("big.num-node")? {
         let db_path = temp_dir.path().join(format!("node-{node_index}"));
         fs::create_dir(&db_path).await?;
-        let db = DB::open_default(&db_path)?;
+        let mut db = DB::open_default(&db_path)?;
         StorageCore::prefill(
-            &db,
+            &mut db,
             Bench::prefill_items(configs.extract()?, StdRng::seed_from_u64(117418)),
             &configs.extract()?,
             [node_index as _].into(),

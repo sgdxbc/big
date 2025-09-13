@@ -21,12 +21,14 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use crate::{NodeIndex, network::NetworkId};
+use crate::network::NetworkId;
 
 use self::message::Message;
 
 pub mod bench;
 pub mod plain;
+
+pub type NodeIndex = u16;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Encode, Decode)]
 pub struct StorageKey([u8; 32]);
@@ -170,7 +172,7 @@ impl StorageCore {
                 Some(result) = self.write_tasks.join_next() => Event::WriteResult(result),
                 else => break,
             } {
-                Event::Op(op) => self.handle_op(op).await,
+                Event::Op(op) => self.handle_op(op).await?,
                 Event::Message(message) => self.handle_message(message),
                 Event::GetResult(result) => {
                     let (key, value) = result??;
@@ -185,11 +187,12 @@ impl StorageCore {
         Ok(())
     }
 
-    async fn handle_op(&mut self, op: StorageOp) {
+    async fn handle_op(&mut self, op: StorageOp) -> anyhow::Result<()> {
         match op {
             StorageOp::Fetch(storage_key, tx_value) => self.handle_fetch(storage_key, tx_value),
-            StorageOp::Bump(updates, tx_ok) => self.handle_bump(updates, tx_ok).await,
+            StorageOp::Bump(updates, tx_ok) => self.handle_bump(updates, tx_ok).await?,
         }
+        Ok(())
     }
 
     fn handle_message(&mut self, message: Message) {
@@ -214,8 +217,13 @@ impl StorageCore {
             .contains(&self.config.primary_node_of(segment_index))
         {
             let db = self.db.clone();
-            self.get_tasks
-                .spawn_blocking(move || Ok((key, db.get(key.0)?)));
+            self.get_tasks.spawn_blocking(move || {
+                let Some(cf) = db.cf_handle(&format!("segment-{segment_index}")) else {
+                    anyhow::bail!("missing column family")
+                };
+                let value = db.get_cf(cf, key.0)?;
+                Ok((key, value))
+            });
         }
     }
 
@@ -223,7 +231,7 @@ impl StorageCore {
         &mut self,
         updates: Vec<(StorageKey, Option<Bytes>)>,
         tx_ok: oneshot::Sender<()>,
-    ) {
+    ) -> anyhow::Result<()> {
         if !self.fetching_keys.is_empty() {
             warn!("bump before fetch complete");
             self.fetching_keys.clear();
@@ -267,19 +275,25 @@ impl StorageCore {
             let _ = tx_ok.send(());
         } else {
             self.bumping = Some(tx_ok);
+
+            let mut batch = WriteBatch::new();
+            for (key, value) in writes {
+                let segment_index = self.config.segment_of(&key);
+                let Some(cf) = self.db.cf_handle(&format!("segment-{segment_index}")) else {
+                    anyhow::bail!("missing column family")
+                };
+                match value {
+                    Some(v) => batch.put_cf(cf, key.0, v),
+                    None => batch.delete_cf(cf, key.0),
+                }
+            }
             let db = self.db.clone();
             self.write_tasks.spawn_blocking(move || {
-                let mut batch = WriteBatch::new();
-                for (key, value) in writes {
-                    match value {
-                        Some(v) => batch.put(key.0, v),
-                        None => batch.delete(key.0),
-                    }
-                }
                 db.write(batch)?;
                 Ok(())
             });
         }
+        Ok(())
     }
 
     fn handle_get_result(&mut self, key: StorageKey, value: Option<Vec<u8>>) {
@@ -347,16 +361,25 @@ impl StorageCore {
     }
 
     pub fn prefill(
-        db: &DB,
+        db: &mut DB,
         items: impl IntoIterator<Item = (StorageKey, Bytes)>,
         config: &StorageConfig,
         node_indices: Vec<NodeIndex>,
     ) -> anyhow::Result<()> {
+        for segment_index in 0..config.num_stripe * config.num_segment_per_stripe() {
+            if node_indices.contains(&config.primary_node_of(segment_index)) {
+                db.create_cf(&format!("segment-{segment_index}"), &Default::default())?
+            }
+        }
+
         let mut batch = WriteBatch::new();
         for (key, value) in items {
             let segment_index = config.segment_of(&key);
             if node_indices.contains(&config.primary_node_of(segment_index)) {
-                batch.put(key.0, &value)
+                let Some(cf) = db.cf_handle(&format!("segment-{segment_index}")) else {
+                    unimplemented!()
+                };
+                batch.put_cf(cf, key.0, &value)
             }
         }
         db.write(batch)?;
