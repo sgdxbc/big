@@ -72,21 +72,23 @@ impl Bench {
             let key = Self::uniform_key(self.rng.random_range(0..=self.config.num_key));
             if self.rng.random_bool(self.config.put_ratio) {
                 self.rng.fill(&mut value[..]);
-                let (tx_ok, rx_ok) = oneshot::channel();
+                let updates = vec![(key, Some(Bytes::copy_from_slice(&value)))];
+
                 start = Instant::now();
-                let _ = self
-                    .tx_op
-                    .send(StorageOp::Bump(
-                        vec![(key, Some(Bytes::copy_from_slice(&value)))],
-                        tx_ok,
-                    ))
-                    .await;
+                let (tx_ok, rx_ok) = oneshot::channel();
+                let _ = self.tx_op.send(StorageOp::Bump(updates, tx_ok)).await;
                 let _ = rx_ok.await;
             } else {
-                let (tx_value, rx_value) = oneshot::channel();
                 start = Instant::now();
+                let (tx_value, rx_value) = oneshot::channel();
                 let _ = self.tx_op.send(StorageOp::Fetch(key, tx_value)).await;
                 let _ = rx_value.await;
+                let (tx_ok, rx_ok) = oneshot::channel();
+                let _ = self
+                    .tx_op
+                    .send(StorageOp::Bump(Default::default(), tx_ok))
+                    .await;
+                let _ = rx_ok.await;
             }
             let duration = start.elapsed();
             self.records.push((start, duration))

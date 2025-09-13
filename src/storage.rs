@@ -50,10 +50,12 @@ pub enum StorageOp {
 }
 
 type SegmentIndex = u32;
+type StripeIndex = u32;
 
 pub struct StorageConfig {
     num_node: NodeIndex,
     num_faulty_node: NodeIndex,
+    num_stripe: StripeIndex,
     // for entry that is utilized at version `v`, push the `v - active_push_ahead` version to peers
     // at the same time, peers maintain the updated entries of the past `active_push_ahead` versions
     // locally
@@ -63,20 +65,31 @@ pub struct StorageConfig {
 }
 
 impl StorageConfig {
-    fn num_segment(&self) -> SegmentIndex {
+    fn num_segment_per_stripe(&self) -> SegmentIndex {
         (self.num_faulty_node + 1) as _
     }
 
     fn segment_of(&self, key: &StorageKey) -> SegmentIndex {
-        StdRng::from_seed(key.0).random_range(0..self.num_segment())
+        StdRng::from_seed(key.0).random_range(0..self.num_stripe * self.num_segment_per_stripe())
     }
 
+    fn stripe_of(&self, segment_index: SegmentIndex) -> StripeIndex {
+        segment_index / self.num_segment_per_stripe()
+    }
+
+    // node index       0   1   2   3       stripe index
+    // is primary of... 0   1               0
+    //                      2   3           1
+    //                          4   5       2
+    //                  7           6       3
+    //                  ...
     fn primary_node_of(&self, segment_index: SegmentIndex) -> NodeIndex {
-        segment_index as _
+        ((segment_index % self.num_segment_per_stripe() + self.stripe_of(segment_index))
+            % self.num_node as SegmentIndex) as _
     }
 }
 
-struct StorageCore {
+pub struct StorageCore {
     config: StorageConfig,
     node_indices: Vec<NodeIndex>,
     db: Arc<DB>,
@@ -332,6 +345,23 @@ impl StorageCore {
             .tx_message
             .try_send((SendTo::All, Message::PushEntry(push_entry)));
     }
+
+    pub fn prefill(
+        db: &DB,
+        items: impl IntoIterator<Item = (StorageKey, Bytes)>,
+        config: &StorageConfig,
+        node_indices: Vec<NodeIndex>,
+    ) -> anyhow::Result<()> {
+        let mut batch = WriteBatch::new();
+        for (key, value) in items {
+            let segment_index = config.segment_of(&key);
+            if node_indices.contains(&config.primary_node_of(segment_index)) {
+                batch.put(key.0, &value)
+            }
+        }
+        db.write(batch)?;
+        Ok(())
+    }
 }
 
 pub mod message {
@@ -479,18 +509,6 @@ impl Storage {
         try_join!(self.core.run(), self.incoming.run(), self.outgoing.run())?;
         Ok(())
     }
-
-    pub fn prefill(
-        db: &DB,
-        items: impl IntoIterator<Item = (StorageKey, Bytes)>,
-    ) -> anyhow::Result<()> {
-        let mut batch = WriteBatch::new();
-        for (key, value) in items {
-            batch.put(key.0, &value);
-        }
-        db.write(batch)?;
-        Ok(())
-    }
 }
 
 mod parse {
@@ -503,6 +521,7 @@ mod parse {
             Ok(Self {
                 num_node: configs.get("big.num-node")?,
                 num_faulty_node: configs.get("big.num-faulty-node")?,
+                num_stripe: configs.get("big.num-stripe")?,
                 active_push_ahead: configs.get("big.active-push-ahead")?,
             })
         }

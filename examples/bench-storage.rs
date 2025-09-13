@@ -1,11 +1,11 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use big::{
     logging::init_logging,
     parse::Configs,
     storage::{
+        StorageCore,
         bench::{Bench, BenchStorage},
-        plain::PlainStorage,
     },
 };
 use rand::{SeedableRng as _, rngs::StdRng};
@@ -21,11 +21,12 @@ async fn main() -> anyhow::Result<()> {
     let mut configs = Configs::new();
     configs.parse(
         "
-bench.num-key   1000000
+bench.num-key   4000000
 bench.put-ratio 0.5
 
 big.num-node            4
 big.num-faulty-node     1
+big.num-stripe          10
 big.active-push-ahead   0
 
 addrs   127.0.0.1:5000
@@ -42,26 +43,28 @@ addrs   127.0.0.1:5003
         let db_path = temp_dir.path().join(format!("node-{node_index}"));
         fs::create_dir(&db_path).await?;
         let db = DB::open_default(&db_path)?;
-        PlainStorage::prefill(
+        StorageCore::prefill(
             &db,
             Bench::prefill_items(configs.extract()?, StdRng::seed_from_u64(117418)),
+            &configs.extract()?,
+            [node_index as _].into(),
         )?;
-        dbs.push(db);
-        println!("db prefilled for node {node_index}")
+        println!("db prefilled for node {node_index}");
+        dbs.push(Arc::new(db))
     }
 
     let mut addrs = configs.get_values("addrs")?;
     addrs.truncate(configs.get("big.num-node")?);
     let cancel = CancellationToken::new();
     let mut tasks = JoinSet::new();
-    for (node_index, db) in dbs.into_iter().enumerate() {
+    for (node_index, db) in dbs.iter().enumerate() {
         let bench = BenchStorage::new(
             node_index as _,
             addrs.clone(),
             configs.extract()?,
             configs.extract()?,
             [node_index as _].into(),
-            db.into(),
+            db.clone(),
             (0..configs.get("big.num-node")?).collect(),
             cancel.clone(),
         );
@@ -79,6 +82,11 @@ addrs   127.0.0.1:5003
         anyhow::Ok(())
     };
     try_join!(bench, timeout)?;
+    let sizes = dbs
+        .iter()
+        .map(|db| db.property_int_value("rocksdb.estimate-live-data-size"))
+        .collect::<Result<Vec<_>, _>>()?;
+    println!("data sizes: {:?}", sizes);
 
     temp_dir.close()?;
     Ok(())

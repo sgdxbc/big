@@ -21,7 +21,7 @@ async fn main() -> anyhow::Result<()> {
     let mut configs = Configs::new();
     configs.parse(
         "
-bench.num-key   1000000
+bench.num-key   4000000
 bench.put-ratio 0.5
 ",
     );
@@ -38,7 +38,7 @@ bench.put-ratio 0.5
     let cancel = CancellationToken::new();
     let bench = BenchPlainStorage::new(configs.extract()?, db.into(), cancel.clone());
     let timeout = async {
-        sleep(Duration::from_secs(1)).await;
+        sleep(Duration::from_secs(10)).await;
         cancel.cancel();
         anyhow::Ok(())
     };
