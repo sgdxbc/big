@@ -32,7 +32,7 @@ impl PlainStorage {
             match op {
                 StorageOp::Fetch(key, tx_value) => {
                     let value = self.db.get(key.0)?;
-                    let _ = tx_value.send(value.map(|v| Bytes::from(v)));
+                    let _ = tx_value.send(value.map(Bytes::from));
                 }
                 StorageOp::Bump(updates, tx_ok) => {
                     let mut batch = WriteBatch::new();

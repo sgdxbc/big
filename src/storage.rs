@@ -76,7 +76,7 @@ impl StorageConfig {
     }
 }
 
-pub struct StorageCore {
+struct StorageCore {
     config: StorageConfig,
     node_indices: Vec<NodeIndex>,
     db: Arc<DB>,
@@ -107,7 +107,7 @@ pub enum SendTo {
 }
 
 impl StorageCore {
-    pub fn new(
+    fn new(
         config: StorageConfig,
         node_indices: Vec<NodeIndex>,
         db: Arc<DB>,
@@ -134,7 +134,7 @@ impl StorageCore {
         }
     }
 
-    pub async fn run(&mut self) -> anyhow::Result<()> {
+    async fn run(mut self) -> anyhow::Result<()> {
         self.cancel
             .clone()
             .run_until_cancelled(self.run_inner())
@@ -352,14 +352,14 @@ pub mod message {
     }
 }
 
-pub struct Incoming {
+struct Incoming {
     cancel: CancellationToken,
     rx_bytes: Receiver<(NetworkId, Vec<u8>)>,
     tx_message: Sender<Message>,
 }
 
 impl Incoming {
-    pub fn new(
+    fn new(
         cancel: CancellationToken,
         rx_bytes: Receiver<(NetworkId, Vec<u8>)>,
         tx_message: Sender<Message>,
@@ -371,7 +371,7 @@ impl Incoming {
         }
     }
 
-    pub async fn run(&mut self) -> anyhow::Result<()> {
+    async fn run(mut self) -> anyhow::Result<()> {
         while let Some(Some((_, bytes))) =
             self.cancel.run_until_cancelled(self.rx_bytes.recv()).await
         {
@@ -383,7 +383,7 @@ impl Incoming {
     }
 }
 
-pub struct Outgoing {
+struct Outgoing {
     node_table: Vec<NetworkId>, // node index -> network id
 
     cancel: CancellationToken,
@@ -392,7 +392,7 @@ pub struct Outgoing {
 }
 
 impl Outgoing {
-    pub fn new(
+    fn new(
         node_table: Vec<NetworkId>,
         cancel: CancellationToken,
         rx_message: Receiver<(SendTo, Message)>,
@@ -406,7 +406,7 @@ impl Outgoing {
         }
     }
 
-    pub async fn run(&mut self) -> anyhow::Result<()> {
+    async fn run(mut self) -> anyhow::Result<()> {
         while let Some(Some((send_to, message))) = self
             .cancel
             .run_until_cancelled(self.rx_message.recv())
@@ -463,8 +463,20 @@ impl Storage {
         }
     }
 
-    pub async fn run(mut self) -> anyhow::Result<()> {
+    pub async fn run(self) -> anyhow::Result<()> {
         try_join!(self.core.run(), self.incoming.run(), self.outgoing.run())?;
+        Ok(())
+    }
+
+    pub fn prefill(
+        db: &DB,
+        items: impl IntoIterator<Item = (StorageKey, Bytes)>,
+    ) -> anyhow::Result<()> {
+        let mut batch = WriteBatch::new();
+        for (key, value) in items {
+            batch.put(key.0, &value);
+        }
+        db.write(batch)?;
         Ok(())
     }
 }
