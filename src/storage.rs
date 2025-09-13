@@ -1,6 +1,7 @@
 use std::{
     cmp::Reverse,
     collections::{BinaryHeap, HashMap, hash_map::Entry},
+    mem::replace,
     sync::Arc,
 };
 
@@ -54,6 +55,7 @@ pub enum StorageOp {
 type SegmentIndex = u32;
 type StripeIndex = u32;
 
+#[derive(Clone)]
 pub struct StorageConfig {
     num_node: NodeIndex,
     num_faulty_node: NodeIndex,
@@ -154,7 +156,9 @@ impl StorageCore {
             .clone()
             .run_until_cancelled(self.run_inner())
             .await
-            .unwrap_or(Ok(()))
+            .unwrap_or(Ok(()))?;
+        tracing::info!(?self.node_indices, "active state size: {}", self.active_state.len());
+        Ok(())
     }
 
     async fn run_inner(&mut self) -> anyhow::Result<()> {
@@ -172,7 +176,7 @@ impl StorageCore {
                 Some(result) = self.write_tasks.join_next() => Event::WriteResult(result),
                 else => break,
             } {
-                Event::Op(op) => self.handle_op(op).await?,
+                Event::Op(op) => self.handle_op(op),
                 Event::Message(message) => self.handle_message(message),
                 Event::GetResult(result) => {
                     let (key, value) = result??;
@@ -187,12 +191,11 @@ impl StorageCore {
         Ok(())
     }
 
-    async fn handle_op(&mut self, op: StorageOp) -> anyhow::Result<()> {
+    fn handle_op(&mut self, op: StorageOp) {
         match op {
             StorageOp::Fetch(storage_key, tx_value) => self.handle_fetch(storage_key, tx_value),
-            StorageOp::Bump(updates, tx_ok) => self.handle_bump(updates, tx_ok).await?,
+            StorageOp::Bump(updates, tx_ok) => self.handle_bump(updates, tx_ok),
         }
-        Ok(())
     }
 
     fn handle_message(&mut self, message: Message) {
@@ -227,15 +230,16 @@ impl StorageCore {
         }
     }
 
-    async fn handle_bump(
+    fn handle_bump(
         &mut self,
         updates: Vec<(StorageKey, Option<Bytes>)>,
         tx_ok: oneshot::Sender<()>,
-    ) -> anyhow::Result<()> {
+    ) {
         if !self.fetching_keys.is_empty() {
             warn!("bump before fetch complete");
             self.fetching_keys.clear();
-            self.get_tasks.shutdown().await
+            self.get_tasks = replace(&mut self.get_tasks, JoinSet::new())
+            // implicitly abort the previous get tasks
         }
 
         self.version += 1;
@@ -244,7 +248,7 @@ impl StorageCore {
         {
             let Reverse((_, key)) = self.active_state_versions.pop().unwrap();
             let Entry::Occupied(entry) = self.active_state.entry(key) else {
-                unimplemented!()
+                unreachable!()
             };
             if entry.get().version == version {
                 entry.remove();
@@ -276,24 +280,24 @@ impl StorageCore {
         } else {
             self.bumping = Some(tx_ok);
 
-            let mut batch = WriteBatch::new();
-            for (key, value) in writes {
-                let segment_index = self.config.segment_of(&key);
-                let Some(cf) = self.db.cf_handle(&format!("segment-{segment_index}")) else {
-                    anyhow::bail!("missing column family")
-                };
-                match value {
-                    Some(v) => batch.put_cf(cf, key.0, v),
-                    None => batch.delete_cf(cf, key.0),
-                }
-            }
+            let config = self.config.clone();
             let db = self.db.clone();
             self.write_tasks.spawn_blocking(move || {
+                let mut batch = WriteBatch::new();
+                for (key, value) in writes {
+                    let segment_index = config.segment_of(&key);
+                    let Some(cf) = db.cf_handle(&format!("segment-{segment_index}")) else {
+                        anyhow::bail!("missing column family")
+                    };
+                    match value {
+                        Some(v) => batch.put_cf(cf, key.0, v),
+                        None => batch.delete_cf(cf, key.0),
+                    }
+                }
                 db.write(batch)?;
                 Ok(())
             });
         }
-        Ok(())
     }
 
     fn handle_get_result(&mut self, key: StorageKey, value: Option<Vec<u8>>) {
