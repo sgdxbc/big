@@ -354,14 +354,14 @@ pub mod message {
 
 pub struct Incoming {
     cancel: CancellationToken,
-    rx_bytes: Receiver<(NetworkId, Bytes)>,
+    rx_bytes: Receiver<(NetworkId, Vec<u8>)>,
     tx_message: Sender<Message>,
 }
 
 impl Incoming {
     pub fn new(
         cancel: CancellationToken,
-        rx_bytes: Receiver<(NetworkId, Bytes)>,
+        rx_bytes: Receiver<(NetworkId, Vec<u8>)>,
         tx_message: Sender<Message>,
     ) -> Self {
         Self {
@@ -435,11 +435,11 @@ impl Storage {
     pub fn new(
         config: StorageConfig,
         node_indices: Vec<NodeIndex>,
-        node_table: Vec<NetworkId>,
         db: Arc<DB>,
+        node_table: Vec<NetworkId>,
         cancel: CancellationToken,
         rx_op: Receiver<StorageOp>,
-        rx_incoming_bytes: Receiver<(NetworkId, Bytes)>,
+        rx_incoming_bytes: Receiver<(NetworkId, Vec<u8>)>,
         tx_outgoing_bytes: Sender<(NetworkId, Bytes)>,
     ) -> Self {
         let (tx_incoming_message, rx_incoming_message) = channel(100);
@@ -463,7 +463,7 @@ impl Storage {
         }
     }
 
-    pub async fn run(&mut self) -> anyhow::Result<()> {
+    pub async fn run(mut self) -> anyhow::Result<()> {
         try_join!(self.core.run(), self.incoming.run(), self.outgoing.run())?;
         Ok(())
     }

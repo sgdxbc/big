@@ -1,23 +1,28 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, net::SocketAddr};
 
 use bytes::Bytes;
-use quinn::{Connection, ConnectionError};
+use quinn::{Connection, ConnectionError, Endpoint};
 use tokio::{
     select,
-    sync::mpsc::{Receiver, Sender},
+    sync::mpsc::{Receiver, Sender, channel},
     task::JoinSet,
 };
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
+
+use crate::cert::{client_config, server_config};
 
 pub type NetworkId = u32;
 
 pub struct Network {
+    id: NetworkId,
+
+    cancel: CancellationToken,
     rx_incoming_connection: Receiver<Connection>,
     rx_outgoing_connection: Receiver<(NetworkId, Connection)>,
     rx_message: Receiver<(NetworkId, Bytes)>,
     tx_message: Sender<(NetworkId, Vec<u8>)>,
 
-    id: NetworkId,
     connections: HashMap<NetworkId, Connection>,
     tasks: JoinSet<anyhow::Result<()>>,
     tx_close: Sender<NetworkId>,
@@ -25,7 +30,38 @@ pub struct Network {
 }
 
 impl Network {
-    pub async fn run(&mut self) -> anyhow::Result<()> {
+    pub fn new(
+        id: NetworkId,
+        cancel: CancellationToken,
+        rx_incoming_connection: Receiver<Connection>,
+        rx_outgoing_connection: Receiver<(NetworkId, Connection)>,
+        rx_message: Receiver<(NetworkId, Bytes)>,
+        tx_message: Sender<(NetworkId, Vec<u8>)>,
+    ) -> Self {
+        let (tx_close, rx_close) = channel(1);
+        Self {
+            id,
+            cancel,
+            rx_incoming_connection,
+            rx_outgoing_connection,
+            rx_message,
+            tx_message,
+            connections: Default::default(),
+            tasks: JoinSet::new(),
+            tx_close,
+            rx_close,
+        }
+    }
+
+    pub async fn run(mut self) -> anyhow::Result<()> {
+        self.cancel
+            .clone()
+            .run_until_cancelled(self.run_inner())
+            .await
+            .unwrap_or(Ok(()))
+    }
+
+    async fn run_inner(&mut self) -> anyhow::Result<()> {
         loop {
             enum Event<R> {
                 IncomingConnection(Connection),
@@ -100,6 +136,63 @@ impl Network {
             let _ = tx_message.send((id, message.to_vec())).await;
         }
         let _ = tx_close.send(id).await;
+        Ok(())
+    }
+}
+
+pub struct Mesh {
+    addrs: Vec<SocketAddr>,
+    id: NetworkId,
+
+    tx_outgoing_connection: Sender<(NetworkId, Connection)>,
+    tx_incoming_connection: Sender<Connection>,
+}
+
+impl Mesh {
+    pub fn new(
+        addrs: Vec<SocketAddr>,
+        id: NetworkId,
+        tx_outgoing_connection: Sender<(NetworkId, Connection)>,
+        tx_incoming_connection: Sender<Connection>,
+    ) -> Self {
+        Self {
+            addrs,
+            id,
+            tx_outgoing_connection,
+            tx_incoming_connection,
+        }
+    }
+
+    pub async fn run(self) -> anyhow::Result<()> {
+        let mut endpoint = Endpoint::server(server_config(), self.addrs[self.id as usize])?;
+        endpoint.set_default_client_config(client_config());
+        let mut tasks = JoinSet::new();
+        let num_connection = self.addrs.len() - 1;
+        for (remote_id, addr) in self.addrs.into_iter().take(self.id as _).enumerate() {
+            let endpoint = endpoint.clone();
+            let tx_outgoing_connection = self.tx_outgoing_connection.clone();
+            tasks.spawn(async move {
+                let connection = endpoint.connect(addr, "server.example")?.await?;
+                let _ = tx_outgoing_connection
+                    .send((remote_id as _, connection))
+                    .await;
+                anyhow::Ok(())
+            });
+        }
+        tasks.spawn(async move {
+            for _ in 0..num_connection - self.id as usize {
+                let connection = endpoint
+                    .accept()
+                    .await
+                    .ok_or(anyhow::format_err!("endpoint closed"))?
+                    .await?;
+                let _ = self.tx_incoming_connection.send(connection).await;
+            }
+            Ok(())
+        });
+        while let Some(res) = tasks.join_next().await {
+            res??
+        }
         Ok(())
     }
 }

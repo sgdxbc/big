@@ -33,7 +33,7 @@ bench.put-ratio 0.5
     println!("db prefilled");
 
     let cancel = CancellationToken::new();
-    let mut bench = BenchPlainStorage::new(configs.extract()?, db.into(), cancel.clone());
+    let bench = BenchPlainStorage::new(configs.extract()?, db.into(), cancel.clone());
     let timeout = async {
         sleep(Duration::from_secs(1)).await;
         cancel.cancel();

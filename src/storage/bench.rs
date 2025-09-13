@@ -1,4 +1,5 @@
 use std::{
+    net::SocketAddr,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -15,9 +16,12 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::NodeIndex;
+use crate::{
+    NodeIndex,
+    network::{Mesh, Network, NetworkId},
+};
 
-use super::{StorageCore, StorageConfig, StorageKey, StorageOp, plain::PlainStorage};
+use super::{Storage, StorageConfig, StorageKey, StorageOp, plain::PlainStorage};
 
 pub struct BenchConfig {
     num_key: u64,
@@ -45,7 +49,7 @@ impl Bench {
         }
     }
 
-    pub async fn run(&mut self) -> anyhow::Result<()> {
+    pub async fn run(mut self) -> anyhow::Result<()> {
         self.cancel
             .clone()
             .run_until_cancelled(self.run_inner())
@@ -116,14 +120,14 @@ impl BenchPlainStorage {
     pub fn new(config: BenchConfig, db: Arc<DB>, cancel: CancellationToken) -> Self {
         let (tx_op, rx_op) = channel(1);
         let bench = Bench::new(config, cancel.clone(), tx_op);
-        let plain = PlainStorage::new(db, cancel, rx_op);
+        let plain_storage = PlainStorage::new(db, cancel, rx_op);
         Self {
             bench,
-            plain_storage: plain,
+            plain_storage,
         }
     }
 
-    pub async fn run(&mut self) -> anyhow::Result<()> {
+    pub async fn run(mut self) -> anyhow::Result<()> {
         try_join!(self.plain_storage.run(), self.bench.run())?;
         Ok(())
     }
@@ -131,36 +135,68 @@ impl BenchPlainStorage {
 
 pub struct BenchStorage {
     bench: Bench,
-    storage: StorageCore,
+    storage: Storage,
+    network: Network,
+    mesh: Mesh,
 }
 
 impl BenchStorage {
     pub fn new(
+        network_id: NetworkId,
+        addrs: Vec<SocketAddr>,
         bench_config: BenchConfig,
         storage_config: StorageConfig,
         node_indices: Vec<NodeIndex>,
         db: Arc<DB>,
+        node_table: Vec<NetworkId>,
         cancel: CancellationToken,
     ) -> Self {
+        let (tx_incoming_connection, rx_incoming_connection) = channel(100);
+        let (tx_outgoing_connection, rx_outgoing_connection) = channel(100);
+        let (tx_incoming_bytes, rx_incoming_bytes) = channel(100);
+        let (tx_outgoing_bytes, rx_outgoing_bytes) = channel(100);
         let (tx_op, rx_op) = channel(1);
-        let (tx_incoming_message, rx_incoming_message) = channel(100);
-        let (tx_outgoing_message, rx_outgoing_message) = channel(100);
 
+        let network = Network::new(
+            network_id,
+            cancel.clone(),
+            rx_incoming_connection,
+            rx_outgoing_connection,
+            rx_outgoing_bytes,
+            tx_incoming_bytes,
+        );
+        let mesh = Mesh::new(
+            addrs,
+            network_id,
+            tx_outgoing_connection,
+            tx_incoming_connection,
+        );
         let bench = Bench::new(bench_config, cancel.clone(), tx_op);
-        let storage = StorageCore::new(
+        let storage = Storage::new(
             storage_config,
             node_indices,
             db,
+            node_table,
             cancel.clone(),
             rx_op,
-            rx_incoming_message,
-            tx_outgoing_message,
+            rx_incoming_bytes,
+            tx_outgoing_bytes,
         );
-        Self { bench, storage }
+        Self {
+            bench,
+            storage,
+            network,
+            mesh,
+        }
     }
 
-    pub async fn run(&mut self) -> anyhow::Result<()> {
-        try_join!(self.storage.run(), self.bench.run())?;
+    pub async fn run(self) -> anyhow::Result<()> {
+        let task = async {
+            self.mesh.run().await?;
+            try_join!(self.bench.run(), self.storage.run())?;
+            Ok(())
+        };
+        try_join!(self.network.run(), task)?;
         Ok(())
     }
 }
