@@ -368,7 +368,7 @@ impl StorageCore {
     ) -> anyhow::Result<()> {
         for segment_index in 0..config.num_stripe * config.num_segment_per_stripe() {
             if node_indices.contains(&config.primary_node_of(segment_index)) {
-                db.create_cf(&format!("segment-{segment_index}"), &Default::default())?
+                db.create_cf(format!("segment-{segment_index}"), &Default::default())?
             }
         }
 

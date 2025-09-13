@@ -8,7 +8,6 @@ use big::{
         bench::{Bench, BenchStorage},
     },
 };
-use rand::{SeedableRng as _, rngs::StdRng};
 use rocksdb::DB;
 use tempfile::tempdir;
 use tokio::{fs, task::JoinSet, time::sleep, try_join};
@@ -45,7 +44,7 @@ addrs   127.0.0.1:5003
         let mut db = DB::open_default(&db_path)?;
         StorageCore::prefill(
             &mut db,
-            Bench::prefill_items(configs.extract()?, StdRng::seed_from_u64(117418)),
+            Bench::prefill_items(configs.extract()?),
             &configs.extract()?,
             [node_index as _].into(),
         )?;

@@ -96,10 +96,8 @@ impl Bench {
         StorageKey(StdRng::seed_from_u64(index).random())
     }
 
-    pub fn prefill_items(
-        config: BenchConfig,
-        mut rng: StdRng,
-    ) -> impl Iterator<Item = (StorageKey, Bytes)> {
+    pub fn prefill_items(config: BenchConfig) -> impl Iterator<Item = (StorageKey, Bytes)> {
+        let mut rng = StdRng::seed_from_u64(117418);
         (0..config.num_key).map(move |i| {
             let key = Self::uniform_key(i);
             let mut value = vec![0; 68];

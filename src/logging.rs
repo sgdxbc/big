@@ -1,4 +1,4 @@
-use std::{env, str::FromStr as _};
+use std::{env, fs::File, path::Path, str::FromStr as _};
 
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{
@@ -10,13 +10,14 @@ pub fn init_logging() {
     fmt_common().finish().with(targets_layer()).init();
 }
 
-pub fn init_logging_file(log_file: std::fs::File) {
+pub fn init_logging_file(path: impl AsRef<Path>) -> anyhow::Result<()> {
     fmt_common()
         .with_ansi(false)
-        .with_writer(log_file)
+        .with_writer(File::create(path)?)
         .finish()
         .with(targets_layer())
-        .init();
+        .try_init()?;
+    Ok(())
 }
 
 fn fmt_common() -> tracing_subscriber::fmt::SubscriberBuilder {

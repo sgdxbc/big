@@ -8,7 +8,6 @@ use big::{
         plain::PlainStorage,
     },
 };
-use rand::{SeedableRng as _, rngs::StdRng};
 use rocksdb::DB;
 use tempfile::tempdir;
 use tokio::{time::sleep, try_join};
@@ -29,10 +28,7 @@ bench.put-ratio 0.5
     let temp_dir = tempdir()?;
     println!("{}", temp_dir.path().display());
     let db = DB::open_default(temp_dir.path())?;
-    PlainStorage::prefill(
-        &db,
-        Bench::prefill_items(configs.extract()?, StdRng::seed_from_u64(117418)),
-    )?;
+    PlainStorage::prefill(&db, Bench::prefill_items(configs.extract()?))?;
     println!("db prefilled");
 
     let cancel = CancellationToken::new();
