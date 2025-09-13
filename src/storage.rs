@@ -64,7 +64,7 @@ pub struct StorageConfig {
 
 impl StorageConfig {
     fn num_segment(&self) -> SegmentIndex {
-        self.num_faulty_node as _
+        (self.num_faulty_node + 1) as _
     }
 
     fn segment_of(&self, key: &StorageKey) -> SegmentIndex {
@@ -478,5 +478,21 @@ impl Storage {
         }
         db.write(batch)?;
         Ok(())
+    }
+}
+
+mod parse {
+    use crate::parse::Extract;
+
+    use super::StorageConfig;
+
+    impl Extract for StorageConfig {
+        fn extract(configs: &crate::parse::Configs) -> anyhow::Result<Self> {
+            Ok(Self {
+                num_node: configs.get("big.num-node")?,
+                num_faulty_node: configs.get("big.num-faulty-node")?,
+                active_push_ahead: configs.get("big.active-push-ahead")?,
+            })
+        }
     }
 }
