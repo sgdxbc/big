@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use big::{
+    logging::init_logging,
     parse::Configs,
     storage::{
         bench::{Bench, BenchPlainStorage},
@@ -15,6 +16,8 @@ use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    init_logging();
+
     let mut configs = Configs::new();
     configs.parse(
         "

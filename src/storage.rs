@@ -144,17 +144,17 @@ impl StorageCore {
 
     async fn run_inner(&mut self) -> anyhow::Result<()> {
         loop {
-            enum Event<GR, PR> {
+            enum Event<GR, WR> {
                 Op(StorageOp),
                 Message(Message),
                 GetResult(GR),
-                PutResult(PR),
+                WriteResult(WR),
             }
             match select! {
                 Some(op) = self.rx_op.recv(), if self.bumping.is_none() => Event::Op(op),
                 Some(message) = self.rx_message.recv() => Event::Message(message),
                 Some(result) = self.get_tasks.join_next() => Event::GetResult(result),
-                Some(result) = self.write_tasks.join_next() => Event::PutResult(result),
+                Some(result) = self.write_tasks.join_next() => Event::WriteResult(result),
                 else => break,
             } {
                 Event::Op(op) => self.handle_op(op).await,
@@ -163,7 +163,7 @@ impl StorageCore {
                     let (key, value) = result??;
                     self.handle_get_result(key, value)
                 }
-                Event::PutResult(result) => {
+                Event::WriteResult(result) => {
                     result??;
                     self.handle_write_result()
                 }
@@ -385,6 +385,7 @@ impl Incoming {
 
 struct Outgoing {
     node_table: Vec<NetworkId>, // node index -> network id
+    node_indices: Vec<NodeIndex>,
 
     cancel: CancellationToken,
     rx_message: Receiver<(SendTo, Message)>,
@@ -394,12 +395,14 @@ struct Outgoing {
 impl Outgoing {
     fn new(
         node_table: Vec<NetworkId>,
+        node_indices: Vec<NodeIndex>,
         cancel: CancellationToken,
         rx_message: Receiver<(SendTo, Message)>,
         tx_bytes: Sender<(NetworkId, Bytes)>,
     ) -> Self {
         Self {
             node_table,
+            node_indices,
             cancel,
             rx_message,
             tx_bytes,
@@ -415,7 +418,10 @@ impl Outgoing {
             let bytes = Bytes::from(bincode::encode_to_vec(&message, standard())?);
             match send_to {
                 SendTo::All => {
-                    for &network_id in &self.node_table {
+                    for (node_id, &network_id) in self.node_table.iter().enumerate() {
+                        if self.node_indices.contains(&(node_id as _)) {
+                            continue;
+                        }
                         let _ = self.tx_bytes.send((network_id, bytes.clone())).await;
                     }
                 }
@@ -447,7 +453,7 @@ impl Storage {
 
         let core = StorageCore::new(
             config,
-            node_indices,
+            node_indices.clone(),
             db,
             cancel.clone(),
             rx_op,
@@ -455,7 +461,13 @@ impl Storage {
             tx_outgoing_message,
         );
         let incoming = Incoming::new(cancel.clone(), rx_incoming_bytes, tx_incoming_message);
-        let outgoing = Outgoing::new(node_table, cancel, rx_outgoing_message, tx_outgoing_bytes);
+        let outgoing = Outgoing::new(
+            node_table,
+            node_indices,
+            cancel,
+            rx_outgoing_message,
+            tx_outgoing_bytes,
+        );
         Self {
             core,
             incoming,

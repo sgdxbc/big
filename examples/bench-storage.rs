@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use big::{
+    logging::init_logging,
     parse::Configs,
     storage::{
         bench::{Bench, BenchStorage},
@@ -15,14 +16,16 @@ use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    init_logging();
+
     let mut configs = Configs::new();
     configs.parse(
         "
 bench.num-key   1000000
 bench.put-ratio 0.5
 
-big.num-node            1
-big.num-faulty-node     0
+big.num-node            4
+big.num-faulty-node     1
 big.active-push-ahead   0
 
 addrs   127.0.0.1:5000
@@ -71,7 +74,7 @@ addrs   127.0.0.1:5003
         anyhow::Ok(())
     };
     let timeout = async {
-        sleep(Duration::from_secs(1)).await;
+        sleep(Duration::from_secs(10)).await;
         cancel.cancel();
         anyhow::Ok(())
     };

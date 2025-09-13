@@ -59,9 +59,8 @@ impl Bench {
             let total = last.0.duration_since(first.0) + last.1;
             let ops = self.records.len() as f64;
             let tps = ops / total.as_secs_f64();
-            println!("ops: {}, total: {:.1?}, tps: {:.2}", ops, total, tps);
             let mean = self.records.iter().map(|r| r.1).sum::<Duration>() / ops as u32;
-            println!("mean latency: {:?}", mean)
+            println!("ops: {ops}, total: {total:.1?}, tps: {tps:.2}, mean latency: {mean:?}")
         }
         Ok(())
     }

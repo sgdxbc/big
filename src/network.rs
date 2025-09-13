@@ -126,14 +126,29 @@ impl Network {
         tx_message: Sender<(NetworkId, Vec<u8>)>,
         tx_close: Sender<NetworkId>,
     ) -> anyhow::Result<()> {
+        let mut tasks = JoinSet::new();
         loop {
-            let mut recv_stream = match connection.accept_uni().await {
-                Ok(stream) => stream,
-                Err(ConnectionError::ApplicationClosed(_)) => break,
-                Err(err) => Err(err)?,
-            };
-            let message = recv_stream.read_to_end(64 << 20).await?;
-            let _ = tx_message.send((id, message.to_vec())).await;
+            enum Event<S, R> {
+                Accept(S),
+                TaskResult(R),
+            }
+            match select! {
+                accept = connection.accept_uni() => Event::Accept(accept),
+                Some(result) = tasks.join_next() => Event::TaskResult(result),
+            } {
+                Event::Accept(Ok(mut recv_stream)) => {
+                    let tx_message = tx_message.clone();
+                    tasks.spawn(async move {
+                        let _ = tx_message
+                            .send((id, recv_stream.read_to_end(64 << 20).await?))
+                            .await;
+                        anyhow::Ok(())
+                    });
+                }
+                Event::Accept(Err(ConnectionError::ApplicationClosed(_))) => break,
+                Event::Accept(Err(err)) => Err(err)?,
+                Event::TaskResult(result) => result??,
+            }
         }
         let _ = tx_close.send(id).await;
         Ok(())
