@@ -2,7 +2,6 @@ use std::{
     cmp::Reverse,
     collections::{BinaryHeap, HashMap, HashSet, hash_map::Entry},
     iter,
-    mem::replace,
     sync::Arc,
 };
 
@@ -53,7 +52,8 @@ pub enum StorageOp {
     // receiving the next op will do. the result channel is currently for measuring latency in the
     // benchmark
     Bump(Vec<(StorageKey, Option<Bytes>)>, oneshot::Sender<()>),
-    // TODO prefetch
+
+    Prefetch(StorageKey, oneshot::Sender<()>), // same as Bump
 }
 
 type SegmentIndex = u32;
@@ -65,12 +65,12 @@ pub struct StorageConfig {
     num_faulty_node: NodeIndex,
     num_stripe: StripeIndex,
     num_backup: NodeIndex,
-    // for entry that is utilized at version `v`, push the `v - active_push_ahead` version to peers
-    // at the same time, peers maintain the updated entries of the past `active_push_ahead` versions
-    // locally
-    // if the entry is not updated during `v - active_push_ahead..v`, the pushed version is the
-    // entry at version `v`, otherwise, the version can be found from the locally maintained entries
-    active_push_ahead: StateVersion,
+    // Prefetch that issued at version `v` matches a Fetch at version `v + prefetch_offset`
+    // when primary nodes receive Prefetch, they push the prefetched entry to other nodes, so for a
+    // Fetch at version `v`, a push of version `v - prefetch_offset` will be received on the nodes
+    // the nodes should keep track of the updates for the last `prefetch_offset` versions, and they
+    // can rely on the pushes for the even earlier updates
+    prefetch_offset: StateVersion,
 }
 
 impl StorageConfig {
@@ -212,10 +212,10 @@ impl StorageCore {
 
     fn handle_op(&mut self, op: StorageOp) -> anyhow::Result<()> {
         match op {
-            StorageOp::Fetch(storage_key, tx_value) => self.handle_fetch(storage_key, tx_value)?,
-            StorageOp::Bump(updates, tx_ok) => self.handle_bump(updates, tx_ok)?,
+            StorageOp::Fetch(storage_key, tx_value) => self.handle_fetch(storage_key, tx_value),
+            StorageOp::Bump(updates, tx_ok) => self.handle_bump(updates, tx_ok),
+            StorageOp::Prefetch(storage_key, tx_ok) => self.handle_prefetch(storage_key, tx_ok),
         }
-        Ok(())
     }
 
     fn handle_message(&mut self, message: Message) {
@@ -230,7 +230,7 @@ impl StorageCore {
         tx_value: oneshot::Sender<Option<Bytes>>,
     ) -> anyhow::Result<()> {
         if let Some(entry) = self.active_state.get(&key) {
-            assert!(entry.version + self.config.active_push_ahead >= self.version);
+            assert!(entry.version + self.config.prefetch_offset >= self.version);
             let _ = tx_value.send(entry.value.clone());
             return Ok(());
             // if the fetch is resolved in this way we don't need to push entry (even if we are the
@@ -240,7 +240,14 @@ impl StorageCore {
         }
 
         self.fetching_keys.insert(key, tx_value);
+        Ok(())
+    }
 
+    fn handle_prefetch(
+        &mut self,
+        key: StorageKey,
+        tx_ok: oneshot::Sender<()>,
+    ) -> anyhow::Result<()> {
         let segment_index = self.config.segment_of(&key);
         if self
             .config
@@ -261,6 +268,7 @@ impl StorageCore {
             let value = self.db.get_cf(cf, key.0)?;
             self.handle_get_result(key, value)
         }
+        let _ = tx_ok.send(());
         Ok(())
     }
 
@@ -272,13 +280,13 @@ impl StorageCore {
         if !self.fetching_keys.is_empty() {
             warn!("bump before fetch complete");
             self.fetching_keys.clear();
-            self.get_tasks = replace(&mut self.get_tasks, JoinSet::new())
+            // self.get_tasks = replace(&mut self.get_tasks, JoinSet::new())
             // implicitly abort the previous get tasks
         }
 
         self.version += 1;
         while let Some(&Reverse((version, _))) = self.active_state_versions.peek()
-            && version + self.config.active_push_ahead < self.version
+            && version + self.config.prefetch_offset < self.version
         {
             let Reverse((_, key)) = self.active_state_versions.pop().unwrap();
             let Entry::Occupied(entry) = self.active_state.entry(key) else {
@@ -364,7 +372,7 @@ impl StorageCore {
     }
 
     fn handle_push_entry(&mut self, push_entry: message::PushEntry) {
-        if push_entry.version < self.version - self.config.active_push_ahead {
+        if push_entry.version + self.config.prefetch_offset < self.version {
             return;
         }
 
@@ -601,7 +609,7 @@ mod parse {
                 num_faulty_node: configs.get("big.num-faulty-node")?,
                 num_stripe: configs.get("big.num-stripe")?,
                 num_backup: configs.get("big.num-backup")?,
-                active_push_ahead: configs.get("big.active-push-ahead")?,
+                prefetch_offset: configs.get("big.prefetch-offset")?,
             })
         }
     }

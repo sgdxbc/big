@@ -20,8 +20,9 @@ async fn main() -> anyhow::Result<()> {
     let mut configs = Configs::new();
     configs.parse(
         "
-bench.num-key   4000000
-bench.put-ratio 0.5
+bench.num-key       1000000
+bench.put-ratio     0.5
+big.prefetch-offset 0
 ",
     );
 

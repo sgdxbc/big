@@ -47,6 +47,9 @@ impl PlainStorage {
                     self.db.write(batch)?;
                     let _ = tx_ok.send(());
                 }
+                StorageOp::Prefetch(_, tx_ok) => {
+                    let _ = tx_ok.send(());
+                }
             }
         }
         Ok(())
