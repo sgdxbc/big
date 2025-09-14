@@ -101,7 +101,14 @@ impl Network {
                     };
                     let connection = connection.clone();
                     self.tasks.spawn(async move {
-                        let mut send_stream = connection.open_uni().await?;
+                        let mut send_stream = match connection.open_uni().await {
+                            Ok(stream) => stream,
+                            Err(ConnectionError::ApplicationClosed(_)) => {
+                                warn!("connection to {id:08x} closed; message dropped");
+                                return Ok(());
+                            }
+                            Err(err) => Err(err)?,
+                        };
                         send_stream.write_all(&message).await?;
                         Ok(())
                     });

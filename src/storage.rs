@@ -256,7 +256,7 @@ impl StorageCore {
                 anyhow::bail!("missing column family")
             };
             let value = self.db.get_cf(cf, key.0)?;
-            self.handle_get_result(key, value);
+            self.handle_get_result(key, value)
         }
         Ok(())
     }
