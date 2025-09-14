@@ -49,6 +49,9 @@ impl StorageKey {
 
 pub enum StorageOp {
     Fetch(StorageKey, oneshot::Sender<Option<Bytes>>),
+    // technically Bump does not require a result channel; if back pressure is demanded, simply not
+    // receiving the next op will do. the result channel is currently for measuring latency in the
+    // benchmark
     Bump(Vec<(StorageKey, Option<Bytes>)>, oneshot::Sender<()>),
     // TODO prefetch
 }
@@ -172,7 +175,7 @@ impl StorageCore {
             .run_until_cancelled(self.run_inner())
             .await
             .unwrap_or(Ok(()))?;
-        while let Some(_) = self.rx_op.recv().await {}
+        while self.rx_op.recv().await.is_some() {}
         tracing::info!(?self.node_indices, "active state size: {}", self.active_state.len());
         Ok(())
     }

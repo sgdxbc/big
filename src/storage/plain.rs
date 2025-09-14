@@ -25,7 +25,7 @@ impl PlainStorage {
             .run_until_cancelled(self.run_inner())
             .await
             .unwrap_or(Ok(()))?;
-        while let Some(_) = self.rx_op.recv().await {}
+        while self.rx_op.recv().await.is_some() {}
         Ok(())
     }
 
