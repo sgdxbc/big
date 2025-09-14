@@ -24,7 +24,9 @@ impl PlainStorage {
             .clone()
             .run_until_cancelled(self.run_inner())
             .await
-            .unwrap_or(Ok(()))
+            .unwrap_or(Ok(()))?;
+        while let Some(_) = self.rx_op.recv().await {}
+        Ok(())
     }
 
     async fn run_inner(&mut self) -> anyhow::Result<()> {

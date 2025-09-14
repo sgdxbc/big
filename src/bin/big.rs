@@ -38,6 +38,10 @@ fn main() -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn role_bench(configs: Configs, index: u16) -> anyhow::Result<()> {
+    if index >= configs.get("big.num-node")? {
+        return Ok(());
+    }
+
     let temp_dir = TempDir::with_prefix("big-db.")?;
     let mut db = DB::open_default(temp_dir.path())?;
     let items = Bench::prefill_items(configs.extract()?);

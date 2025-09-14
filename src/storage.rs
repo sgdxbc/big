@@ -172,6 +172,7 @@ impl StorageCore {
             .run_until_cancelled(self.run_inner())
             .await
             .unwrap_or(Ok(()))?;
+        while let Some(_) = self.rx_op.recv().await {}
         tracing::info!(?self.node_indices, "active state size: {}", self.active_state.len());
         Ok(())
     }
@@ -224,11 +225,14 @@ impl StorageCore {
             assert!(entry.version + self.config.active_push_ahead >= self.version);
             let _ = tx_value.send(entry.value.clone());
             return;
-            // in this branch we don't need to push entry anyway. if the entry is among active
-            // state on our side, it must also be active on the other nodes
+            // if the fetch is resolved in this way we don't need to push entry (even if we are the
+            // primary). because if the entry is among active state on our side, it must also be
+            // active on the other nodes, and they will resolve the fetch in the same way without
+            // waiting for the push
         }
 
         self.fetching_keys.insert(key, tx_value);
+
         let segment_index = self.config.segment_of(&key);
         if self
             .config
@@ -286,10 +290,7 @@ impl StorageCore {
                 version: self.version,
                 value,
             };
-
-            self.active_state.insert(key, entry);
-            self.active_state_versions
-                .push(Reverse((self.version, key)))
+            self.may_install_entry(key, entry)
         }
 
         if writes.is_empty() {
@@ -320,13 +321,8 @@ impl StorageCore {
             version: self.version,
             value: value.map(Bytes::from),
         };
-        if let Some(active_entry) = self.active_state.get(&key)
-            && active_entry.version >= entry.version
-        {
-            return;
-        }
-
-        self.install_entry(key, entry)
+        self.may_push_entry(key, entry.value.clone());
+        self.may_install_entry(key, entry)
     }
 
     fn handle_write_result(&mut self) {
@@ -343,30 +339,23 @@ impl StorageCore {
         if push_entry.version < self.version - self.config.active_push_ahead {
             return;
         }
-        if let Some(active_entry) = self.active_state.get(&push_entry.key)
-            && active_entry.version >= push_entry.version
-        {
-            return;
-        }
 
         let entry = ActiveEntry {
             version: push_entry.version,
             value: push_entry.value.map(Bytes::from),
         };
-        self.install_entry(push_entry.key, entry)
+        self.may_install_entry(push_entry.key, entry)
     }
 
-    fn install_entry(&mut self, key: StorageKey, entry: ActiveEntry) {
+    fn may_install_entry(&mut self, key: StorageKey, entry: ActiveEntry) {
+        if let Some(active_entry) = self.active_state.get(&key)
+            && active_entry.version >= entry.version
+        {
+            return;
+        }
+
         if let Some(tx_value) = self.fetching_keys.remove(&key) {
             let _ = tx_value.send(entry.value.clone());
-
-            let segment = self.config.segment_of(&key);
-            if self
-                .node_indices
-                .contains(&self.config.primary_node_of(segment))
-            {
-                self.push_entry(key, entry.value.clone())
-            }
         }
 
         self.active_state_versions
@@ -374,7 +363,15 @@ impl StorageCore {
         self.active_state.insert(key, entry);
     }
 
-    fn push_entry(&self, key: StorageKey, value: Option<Bytes>) {
+    fn may_push_entry(&self, key: StorageKey, value: Option<Bytes>) {
+        let segment = self.config.segment_of(&key);
+        if !self
+            .node_indices
+            .contains(&self.config.primary_node_of(segment))
+        {
+            return;
+        }
+
         let push_entry = message::PushEntry {
             key,
             value: value.map(|v| v.to_vec()),
