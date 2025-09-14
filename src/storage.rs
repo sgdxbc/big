@@ -16,7 +16,6 @@ use tokio::{
         mpsc::{Receiver, Sender, channel},
         oneshot,
     },
-    task::JoinSet,
     try_join,
 };
 use tokio_util::sync::CancellationToken;
@@ -46,14 +45,16 @@ impl StorageKey {
     }
 }
 
+type BumpUpdates = Vec<(StorageKey, Option<Bytes>)>;
+
 pub enum StorageOp {
     Fetch(StorageKey, oneshot::Sender<Option<Bytes>>),
     // technically Bump does not require a result channel; if back pressure is demanded, simply not
     // receiving the next op will do. the result channel is currently for measuring latency in the
     // benchmark
-    Bump(Vec<(StorageKey, Option<Bytes>)>, oneshot::Sender<()>),
+    Bump(BumpUpdates, oneshot::Sender<()>),
 
-    Prefetch(StorageKey, oneshot::Sender<()>), // same as Bump
+    Prefetch(StorageKey, oneshot::Sender<()>), // same reason as Bump
 }
 
 type SegmentIndex = u32;
@@ -126,8 +127,8 @@ pub struct StorageCore {
     active_state_versions: BinaryHeap<Reverse<(StateVersion, StorageKey)>>,
     fetching_keys: HashMap<StorageKey, oneshot::Sender<Option<Bytes>>>,
     bumping: Option<oneshot::Sender<()>>,
-    get_tasks: JoinSet<anyhow::Result<(StorageKey, Option<Vec<u8>>)>>,
-    write_tasks: JoinSet<anyhow::Result<()>>,
+    // get_tasks: JoinSet<anyhow::Result<(StorageKey, Option<Vec<u8>>)>>,
+    // write_tasks: JoinSet<anyhow::Result<()>>,
 }
 
 #[derive(Clone)]
@@ -164,8 +165,8 @@ impl StorageCore {
             active_state_versions: Default::default(),
             fetching_keys: Default::default(),
             bumping: None,
-            get_tasks: JoinSet::new(),
-            write_tasks: JoinSet::new(),
+            // get_tasks: JoinSet::new(),
+            // write_tasks: JoinSet::new(),
         }
     }
 
@@ -182,29 +183,30 @@ impl StorageCore {
 
     async fn run_inner(&mut self) -> anyhow::Result<()> {
         loop {
-            enum Event<GR, WR> {
+            // enum Event<GR, WR> {
+            enum Event {
                 Op(StorageOp),
                 Message(Message),
-                GetResult(GR),
-                WriteResult(WR),
+                // GetResult(GR),
+                // WriteResult(WR),
             }
             match select! {
                 Some(op) = self.rx_op.recv(), if self.bumping.is_none() => Event::Op(op),
                 Some(message) = self.rx_message.recv() => Event::Message(message),
-                Some(result) = self.get_tasks.join_next() => Event::GetResult(result),
-                Some(result) = self.write_tasks.join_next() => Event::WriteResult(result),
+                // Some(result) = self.get_tasks.join_next() => Event::GetResult(result),
+                // Some(result) = self.write_tasks.join_next() => Event::WriteResult(result),
                 else => break,
             } {
                 Event::Op(op) => self.handle_op(op)?,
                 Event::Message(message) => self.handle_message(message),
-                Event::GetResult(result) => {
-                    let (key, value) = result??;
-                    self.handle_get_result(key, value)
-                }
-                Event::WriteResult(result) => {
-                    result??;
-                    self.handle_write_result()
-                }
+                // Event::GetResult(result) => {
+                //     let (key, value) = result??;
+                //     self.handle_get_result(key, value)
+                // }
+                // Event::WriteResult(result) => {
+                //     result??;
+                //     self.handle_write_result()
+                // }
             }
         }
         Ok(())
@@ -279,9 +281,7 @@ impl StorageCore {
     ) -> anyhow::Result<()> {
         if !self.fetching_keys.is_empty() {
             warn!("bump before fetch complete");
-            self.fetching_keys.clear();
-            // self.get_tasks = replace(&mut self.get_tasks, JoinSet::new())
-            // implicitly abort the previous get tasks
+            self.fetching_keys.clear() // implicitly close result channels
         }
 
         self.version += 1;
@@ -362,9 +362,9 @@ impl StorageCore {
     }
 
     fn handle_write_result(&mut self) {
-        if !self.write_tasks.is_empty() {
-            return;
-        }
+        // if !self.write_tasks.is_empty() {
+        //     return;
+        // }
         let Some(tx_ok) = self.bumping.take() else {
             unimplemented!()
         };
