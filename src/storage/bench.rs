@@ -147,8 +147,7 @@ impl BenchStorage {
         node_table: Vec<NetworkId>,
         cancel: CancellationToken,
     ) -> Self {
-        let (tx_incoming_connection, rx_incoming_connection) = channel(100);
-        let (tx_outgoing_connection, rx_outgoing_connection) = channel(100);
+        let (tx_peer, rx_peer) = channel(100);
         let (tx_incoming_bytes, rx_incoming_bytes) = channel(100);
         let (tx_outgoing_bytes, rx_outgoing_bytes) = channel(100);
         let (tx_op, rx_op) = channel(1);
@@ -156,17 +155,11 @@ impl BenchStorage {
         let network = Network::new(
             network_id,
             cancel.clone(),
-            rx_incoming_connection,
-            rx_outgoing_connection,
+            rx_peer,
             rx_outgoing_bytes,
             tx_incoming_bytes,
         );
-        let mesh = Mesh::new(
-            addrs,
-            network_id,
-            tx_outgoing_connection,
-            tx_incoming_connection,
-        );
+        let mesh = Mesh::new(addrs, network_id, tx_peer);
         let bench = Bench::new(bench_config, cancel.clone(), tx_op);
         let storage = Storage::new(
             storage_config,
