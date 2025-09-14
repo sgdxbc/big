@@ -192,7 +192,7 @@ impl StorageCore {
                 Some(result) = self.write_tasks.join_next() => Event::WriteResult(result),
                 else => break,
             } {
-                Event::Op(op) => self.handle_op(op),
+                Event::Op(op) => self.handle_op(op)?,
                 Event::Message(message) => self.handle_message(message),
                 Event::GetResult(result) => {
                     let (key, value) = result??;
@@ -207,11 +207,12 @@ impl StorageCore {
         Ok(())
     }
 
-    fn handle_op(&mut self, op: StorageOp) {
+    fn handle_op(&mut self, op: StorageOp) -> anyhow::Result<()> {
         match op {
-            StorageOp::Fetch(storage_key, tx_value) => self.handle_fetch(storage_key, tx_value),
-            StorageOp::Bump(updates, tx_ok) => self.handle_bump(updates, tx_ok),
+            StorageOp::Fetch(storage_key, tx_value) => self.handle_fetch(storage_key, tx_value)?,
+            StorageOp::Bump(updates, tx_ok) => self.handle_bump(updates, tx_ok)?,
         }
+        Ok(())
     }
 
     fn handle_message(&mut self, message: Message) {
@@ -220,11 +221,15 @@ impl StorageCore {
         }
     }
 
-    fn handle_fetch(&mut self, key: StorageKey, tx_value: oneshot::Sender<Option<Bytes>>) {
+    fn handle_fetch(
+        &mut self,
+        key: StorageKey,
+        tx_value: oneshot::Sender<Option<Bytes>>,
+    ) -> anyhow::Result<()> {
         if let Some(entry) = self.active_state.get(&key) {
             assert!(entry.version + self.config.active_push_ahead >= self.version);
             let _ = tx_value.send(entry.value.clone());
-            return;
+            return Ok(());
             // if the fetch is resolved in this way we don't need to push entry (even if we are the
             // primary). because if the entry is among active state on our side, it must also be
             // active on the other nodes, and they will resolve the fetch in the same way without
@@ -239,22 +244,28 @@ impl StorageCore {
             .nodes_of(segment_index)
             .any(|node_index| self.node_indices.contains(&node_index))
         {
-            let db = self.db.clone();
-            self.get_tasks.spawn_blocking(move || {
-                let Some(cf) = db.cf_handle(&format!("segment-{segment_index}")) else {
-                    anyhow::bail!("missing column family")
-                };
-                let value = db.get_cf(cf, key.0)?;
-                Ok((key, value))
-            });
+            // let db = self.db.clone();
+            // self.get_tasks.spawn_blocking(move || {
+            //     let Some(cf) = db.cf_handle(&format!("segment-{segment_index}")) else {
+            //         anyhow::bail!("missing column family")
+            //     };
+            //     let value = db.get_cf(cf, key.0)?;
+            //     Ok((key, value))
+            // });
+            let Some(cf) = self.db.cf_handle(&format!("segment-{segment_index}")) else {
+                anyhow::bail!("missing column family")
+            };
+            let value = self.db.get_cf(cf, key.0)?;
+            self.handle_get_result(key, value);
         }
+        Ok(())
     }
 
     fn handle_bump(
         &mut self,
         updates: Vec<(StorageKey, Option<Bytes>)>,
         tx_ok: oneshot::Sender<()>,
-    ) {
+    ) -> anyhow::Result<()> {
         if !self.fetching_keys.is_empty() {
             warn!("bump before fetch complete");
             self.fetching_keys.clear();
@@ -298,22 +309,36 @@ impl StorageCore {
         } else {
             self.bumping = Some(tx_ok);
 
-            let db = self.db.clone();
-            self.write_tasks.spawn_blocking(move || {
-                let mut batch = WriteBatch::new();
-                for (segment_index, key, value) in writes {
-                    let Some(cf) = db.cf_handle(&format!("segment-{segment_index}")) else {
-                        anyhow::bail!("missing column family")
-                    };
-                    match value {
-                        Some(v) => batch.put_cf(cf, key.0, v),
-                        None => batch.delete_cf(cf, key.0),
-                    }
+            // let db = self.db.clone();
+            // self.write_tasks.spawn_blocking(move || {
+            //     let mut batch = WriteBatch::new();
+            //     for (segment_index, key, value) in writes {
+            //         let Some(cf) = db.cf_handle(&format!("segment-{segment_index}")) else {
+            //             anyhow::bail!("missing column family")
+            //         };
+            //         match value {
+            //             Some(v) => batch.put_cf(cf, key.0, v),
+            //             None => batch.delete_cf(cf, key.0),
+            //         }
+            //     }
+            //     db.write(batch)?;
+            //     Ok(())
+            // });
+
+            let mut batch = WriteBatch::new();
+            for (segment_index, key, value) in writes {
+                let Some(cf) = self.db.cf_handle(&format!("segment-{segment_index}")) else {
+                    anyhow::bail!("missing column family")
+                };
+                match value {
+                    Some(v) => batch.put_cf(cf, key.0, v),
+                    None => batch.delete_cf(cf, key.0),
                 }
-                db.write(batch)?;
-                Ok(())
-            });
+            }
+            self.db.write(batch)?;
+            self.handle_write_result()
         }
+        Ok(())
     }
 
     fn handle_get_result(&mut self, key: StorageKey, value: Option<Vec<u8>>) {

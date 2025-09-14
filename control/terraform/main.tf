@@ -101,7 +101,7 @@ resource "aws_instance" "server" {
   count = var.server_count
 
   ami                    = data.aws_ami.ubuntu.id
-  instance_type          = "c6a.large"
+  instance_type          = "c6a.xlarge"
   subnet_id              = resource.aws_subnet.main.id
   vpc_security_group_ids = [resource.aws_security_group.main.id]
   key_name               = aws_key_pair.main.key_name
