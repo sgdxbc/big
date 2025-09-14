@@ -29,7 +29,7 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    if let Some(index) = role.strip_prefix("bench.") {
+    if let Some(index) = role.strip_prefix("bench") {
         role_bench(configs, index.parse()?)
     } else {
         anyhow::bail!("unknown role: {role}")

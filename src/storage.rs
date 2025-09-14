@@ -1,6 +1,7 @@
 use std::{
     cmp::Reverse,
-    collections::{BinaryHeap, HashMap, hash_map::Entry},
+    collections::{BinaryHeap, HashMap, HashSet, hash_map::Entry},
+    iter,
     mem::replace,
     sync::Arc,
 };
@@ -8,7 +9,7 @@ use std::{
 use bincode::{Decode, Encode, config::standard};
 use bytes::Bytes;
 use primitive_types::H256;
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand::{Rng, SeedableRng, rngs::StdRng, seq::IteratorRandom};
 use rocksdb::{DB, WriteBatch};
 use tokio::{
     select,
@@ -60,6 +61,7 @@ pub struct StorageConfig {
     num_node: NodeIndex,
     num_faulty_node: NodeIndex,
     num_stripe: StripeIndex,
+    num_backup: NodeIndex,
     // for entry that is utilized at version `v`, push the `v - active_push_ahead` version to peers
     // at the same time, peers maintain the updated entries of the past `active_push_ahead` versions
     // locally
@@ -90,6 +92,19 @@ impl StorageConfig {
     fn primary_node_of(&self, segment_index: SegmentIndex) -> NodeIndex {
         ((segment_index % self.num_segment_per_stripe() + self.stripe_of(segment_index))
             % self.num_node as SegmentIndex) as _
+    }
+
+    fn nodes_of(&self, segment_index: SegmentIndex) -> impl Iterator<Item = NodeIndex> {
+        let primary = self.primary_node_of(segment_index);
+        let backups = (0..self.num_node - 1).choose_multiple(
+            &mut StdRng::seed_from_u64(segment_index as _),
+            self.num_backup as _,
+        );
+        iter::once(primary).chain(
+            backups
+                .into_iter()
+                .map(move |index| index + (index >= primary) as NodeIndex),
+        )
     }
 }
 
@@ -216,8 +231,9 @@ impl StorageCore {
         self.fetching_keys.insert(key, tx_value);
         let segment_index = self.config.segment_of(&key);
         if self
-            .node_indices
-            .contains(&self.config.primary_node_of(segment_index))
+            .config
+            .nodes_of(segment_index)
+            .any(|node_index| self.node_indices.contains(&node_index))
         {
             let db = self.db.clone();
             self.get_tasks.spawn_blocking(move || {
@@ -259,10 +275,11 @@ impl StorageCore {
         for (key, value) in updates {
             let segment_index = self.config.segment_of(&key);
             if self
-                .node_indices
-                .contains(&self.config.primary_node_of(segment_index))
+                .config
+                .nodes_of(segment_index)
+                .any(|node_index| self.node_indices.contains(&node_index))
             {
-                writes.push((key, value.clone()))
+                writes.push((segment_index, key, value.clone()))
             }
 
             let entry = ActiveEntry {
@@ -280,12 +297,10 @@ impl StorageCore {
         } else {
             self.bumping = Some(tx_ok);
 
-            let config = self.config.clone();
             let db = self.db.clone();
             self.write_tasks.spawn_blocking(move || {
                 let mut batch = WriteBatch::new();
-                for (key, value) in writes {
-                    let segment_index = config.segment_of(&key);
+                for (segment_index, key, value) in writes {
                     let Some(cf) = db.cf_handle(&format!("segment-{segment_index}")) else {
                         anyhow::bail!("missing column family")
                     };
@@ -305,7 +320,13 @@ impl StorageCore {
             version: self.version,
             value: value.map(Bytes::from),
         };
-        self.insert_entry(key, entry)
+        if let Some(active_entry) = self.active_state.get(&key)
+            && active_entry.version >= entry.version
+        {
+            return;
+        }
+
+        self.install_entry(key, entry)
     }
 
     fn handle_write_result(&mut self) {
@@ -332,10 +353,10 @@ impl StorageCore {
             version: push_entry.version,
             value: push_entry.value.map(Bytes::from),
         };
-        self.insert_entry(push_entry.key, entry)
+        self.install_entry(push_entry.key, entry)
     }
 
-    fn insert_entry(&mut self, key: StorageKey, entry: ActiveEntry) {
+    fn install_entry(&mut self, key: StorageKey, entry: ActiveEntry) {
         if let Some(tx_value) = self.fetching_keys.remove(&key) {
             let _ = tx_value.send(entry.value.clone());
 
@@ -370,8 +391,13 @@ impl StorageCore {
         config: &StorageConfig,
         node_indices: Vec<NodeIndex>,
     ) -> anyhow::Result<()> {
+        let mut segment_indices = HashSet::new();
         for segment_index in 0..config.num_stripe * config.num_segment_per_stripe() {
-            if node_indices.contains(&config.primary_node_of(segment_index)) {
+            if config
+                .nodes_of(segment_index)
+                .any(|node_index| node_indices.contains(&node_index))
+            {
+                segment_indices.insert(segment_index);
                 db.create_cf(format!("segment-{segment_index}"), &Default::default())?
             }
         }
@@ -379,7 +405,7 @@ impl StorageCore {
         let mut batch = WriteBatch::new();
         for (key, value) in items {
             let segment_index = config.segment_of(&key);
-            if node_indices.contains(&config.primary_node_of(segment_index)) {
+            if segment_indices.contains(&segment_index) {
                 let Some(cf) = db.cf_handle(&format!("segment-{segment_index}")) else {
                     unimplemented!()
                 };
@@ -549,6 +575,7 @@ mod parse {
                 num_node: configs.get("big.num-node")?,
                 num_faulty_node: configs.get("big.num-faulty-node")?,
                 num_stripe: configs.get("big.num-stripe")?,
+                num_backup: configs.get("big.num-backup")?,
                 active_push_ahead: configs.get("big.active-push-ahead")?,
             })
         }

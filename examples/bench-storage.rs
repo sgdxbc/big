@@ -26,6 +26,7 @@ bench.put-ratio 0.5
 big.num-node            4
 big.num-faulty-node     1
 big.num-stripe          10
+big.num-backup          1
 big.active-push-ahead   0
 
 addrs   127.0.0.1:5000

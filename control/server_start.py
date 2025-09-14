@@ -4,7 +4,7 @@ from common import *
 def task(hosts, role):
     tasks = []
     for index, host in enumerate(hosts):
-        tasks.append(Ssh(host, f"cd {deploy_dir} && ./big {role}.{index}"))
+        tasks.append(Ssh(host, f"cd {deploy_dir} && ./big {role}{index}"))
     return tasks
 
 
