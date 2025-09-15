@@ -16,6 +16,7 @@ use tokio::{
         mpsc::{Receiver, Sender, channel},
         oneshot,
     },
+    task::JoinSet,
     try_join,
 };
 use tokio_util::sync::CancellationToken;
@@ -125,9 +126,9 @@ pub struct StorageCore {
     version: StateVersion,
     active_state: HashMap<StorageKey, ActiveEntry>,
     active_state_versions: BinaryHeap<Reverse<(StateVersion, StorageKey)>>,
-    fetching_keys: HashMap<StorageKey, oneshot::Sender<Option<Bytes>>>,
-    bumping: Option<oneshot::Sender<()>>,
-    // get_tasks: JoinSet<anyhow::Result<(StorageKey, Option<Vec<u8>>)>>,
+    fetch_tx_values: HashMap<StorageKey, oneshot::Sender<Option<Bytes>>>,
+    bump_tx_ok: Option<oneshot::Sender<()>>,
+    get_tasks: JoinSet<anyhow::Result<(StorageKey, ActiveEntry)>>,
     // write_tasks: JoinSet<anyhow::Result<()>>,
 }
 
@@ -163,9 +164,9 @@ impl StorageCore {
             version: 0,
             active_state: Default::default(),
             active_state_versions: Default::default(),
-            fetching_keys: Default::default(),
-            bumping: None,
-            // get_tasks: JoinSet::new(),
+            fetch_tx_values: Default::default(),
+            bump_tx_ok: None,
+            get_tasks: JoinSet::new(),
             // write_tasks: JoinSet::new(),
         }
     }
@@ -184,39 +185,40 @@ impl StorageCore {
     async fn run_inner(&mut self) -> anyhow::Result<()> {
         loop {
             // enum Event<GR, WR> {
-            enum Event {
+            enum Event<GR> {
                 Op(StorageOp),
                 Message(Message),
-                // GetResult(GR),
+                GetResult(GR),
                 // WriteResult(WR),
             }
             match select! {
-                Some(op) = self.rx_op.recv(), if self.bumping.is_none() => Event::Op(op),
+                Some(op) = self.rx_op.recv(), if self.bump_tx_ok.is_none() => Event::Op(op),
                 Some(message) = self.rx_message.recv() => Event::Message(message),
-                // Some(result) = self.get_tasks.join_next() => Event::GetResult(result),
+                Some(result) = self.get_tasks.join_next() => Event::GetResult(result),
                 // Some(result) = self.write_tasks.join_next() => Event::WriteResult(result),
                 else => break,
             } {
-                Event::Op(op) => self.handle_op(op)?,
+                Event::Op(op) => self.handle_op(op).await?,
                 Event::Message(message) => self.handle_message(message),
-                // Event::GetResult(result) => {
-                //     let (key, value) = result??;
-                //     self.handle_get_result(key, value)
-                // }
-                // Event::WriteResult(result) => {
-                //     result??;
-                //     self.handle_write_result()
-                // }
+                Event::GetResult(result) => {
+                    let (key, entry) = result??;
+                    self.handle_get_result(key, entry)
+                } // Event::WriteResult(result) => {
+                  //     result??;
+                  //     self.handle_write_result()
+                  // }
             }
         }
         Ok(())
     }
 
-    fn handle_op(&mut self, op: StorageOp) -> anyhow::Result<()> {
+    async fn handle_op(&mut self, op: StorageOp) -> anyhow::Result<()> {
         match op {
             StorageOp::Fetch(storage_key, tx_value) => self.handle_fetch(storage_key, tx_value),
             StorageOp::Bump(updates, tx_ok) => self.handle_bump(updates, tx_ok),
-            StorageOp::Prefetch(storage_key, tx_ok) => self.handle_prefetch(storage_key, tx_ok),
+            StorageOp::Prefetch(storage_key, tx_ok) => {
+                self.handle_prefetch(storage_key, tx_ok).await
+            }
         }
     }
 
@@ -241,11 +243,12 @@ impl StorageCore {
             // waiting for the push
         }
 
-        self.fetching_keys.insert(key, tx_value);
+        let replaced = self.fetch_tx_values.insert(key, tx_value);
+        anyhow::ensure!(replaced.is_none(), "concurrent fetch for the same key");
         Ok(())
     }
 
-    fn handle_prefetch(
+    async fn handle_prefetch(
         &mut self,
         key: StorageKey,
         tx_ok: oneshot::Sender<()>,
@@ -257,18 +260,31 @@ impl StorageCore {
             .any(|node_index| self.node_indices.contains(&node_index))
         {
             // let db = self.db.clone();
-            // self.get_tasks.spawn_blocking(move || {
+            // let version = self.version;
+            // let (tx_snapshot, rx_snapshot) = oneshot::channel();
+            // self.get_tasks.spawn(async move {
             //     let Some(cf) = db.cf_handle(&format!("segment-{segment_index}")) else {
             //         anyhow::bail!("missing column family")
             //     };
-            //     let value = db.get_cf(cf, key.0)?;
-            //     Ok((key, value))
+            //     let snapshot = db.snapshot();
+            //     let _ = tx_snapshot.send(());
+            //     let value = snapshot.get_cf(cf, key.0)?;
+            //     let entry = ActiveEntry {
+            //         version,
+            //         value: value.map(Bytes::from),
+            //     };
+            //     Ok((key, entry))
             // });
+            // let _ = rx_snapshot.await;
             let Some(cf) = self.db.cf_handle(&format!("segment-{segment_index}")) else {
                 anyhow::bail!("missing column family")
             };
             let value = self.db.get_cf(cf, key.0)?;
-            self.handle_get_result(key, value)
+            let entry = ActiveEntry {
+                version: self.version,
+                value: value.map(Bytes::from),
+            };
+            self.handle_get_result(key, entry)
         }
         let _ = tx_ok.send(());
         Ok(())
@@ -279,9 +295,9 @@ impl StorageCore {
         updates: Vec<(StorageKey, Option<Bytes>)>,
         tx_ok: oneshot::Sender<()>,
     ) -> anyhow::Result<()> {
-        if !self.fetching_keys.is_empty() {
+        if !self.fetch_tx_values.is_empty() {
             warn!("bump before fetch complete");
-            self.fetching_keys.clear() // implicitly close result channels
+            self.fetch_tx_values.clear() // implicitly close result channels
         }
 
         self.version += 1;
@@ -318,7 +334,7 @@ impl StorageCore {
         if writes.is_empty() {
             let _ = tx_ok.send(());
         } else {
-            self.bumping = Some(tx_ok);
+            self.bump_tx_ok = Some(tx_ok);
 
             // let db = self.db.clone();
             // self.write_tasks.spawn_blocking(move || {
@@ -352,11 +368,7 @@ impl StorageCore {
         Ok(())
     }
 
-    fn handle_get_result(&mut self, key: StorageKey, value: Option<Vec<u8>>) {
-        let entry = ActiveEntry {
-            version: self.version,
-            value: value.map(Bytes::from),
-        };
+    fn handle_get_result(&mut self, key: StorageKey, entry: ActiveEntry) {
         self.may_push_entry(key, entry.value.clone());
         self.may_install_entry(key, entry)
     }
@@ -365,7 +377,7 @@ impl StorageCore {
         // if !self.write_tasks.is_empty() {
         //     return;
         // }
-        let Some(tx_ok) = self.bumping.take() else {
+        let Some(tx_ok) = self.bump_tx_ok.take() else {
             unimplemented!()
         };
         let _ = tx_ok.send(());
@@ -390,7 +402,7 @@ impl StorageCore {
             return;
         }
 
-        if let Some(tx_value) = self.fetching_keys.remove(&key) {
+        if let Some(tx_value) = self.fetch_tx_values.remove(&key) {
             let _ = tx_value.send(entry.value.clone());
         }
 
