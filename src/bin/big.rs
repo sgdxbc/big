@@ -9,7 +9,7 @@ use big::{
         plain::PlainStorage,
     },
 };
-use rocksdb::DB;
+use rocksdb::{DB, Options};
 use tempfile::TempDir;
 use tokio::{time::sleep, try_join};
 use tokio_util::sync::CancellationToken;
@@ -43,23 +43,44 @@ async fn role_bench(configs: Configs, index: u16) -> anyhow::Result<()> {
     }
 
     let temp_dir = TempDir::with_prefix("big-db.")?;
-    let mut db = DB::open_default(temp_dir.path())?;
+    let mut options = Options::default();
+    options.prepare_for_bulk_load();
+    options.create_if_missing(true);
+    let mut db = DB::open(&options, temp_dir.path())?;
     let items = Bench::prefill_items(configs.extract()?);
+    if configs.get("big.plain-storage")? {
+        PlainStorage::prefill(&db, items)?;
+        info!("db prefilled");
+        drop(db);
+        info!("db start reopening");
+        db = DB::open_default(temp_dir.path())?;
+        info!("db reopened")
+    } else {
+        let cfs = StorageCore::prefill(&mut db, items, &configs.extract()?, [index].into())?;
+        info!("db prefilled");
+        drop(db);
+        info!("db start reopening");
+        db = DB::open_cf(&Default::default(), temp_dir.path(), cfs)?;
+        info!("db reopened")
+    }
+    db.get("")?;
+    db.put("", "")?;
+    info!("db ready");
+    let db = db.into();
+
     let cancel = CancellationToken::new();
     let timeout = {
         let cancel = cancel.clone();
         async move {
-            sleep(Duration::from_secs(10)).await;
+            sleep(Duration::from_secs(20)).await;
             cancel.cancel();
             anyhow::Ok(())
         }
     };
     if configs.get("big.plain-storage")? {
-        PlainStorage::prefill(&db, items)?;
-        let bench = BenchPlainStorage::new(configs.extract()?, db.into(), cancel);
+        let bench = BenchPlainStorage::new(configs.extract()?, db, cancel);
         try_join!(bench.run(), timeout)?;
     } else {
-        StorageCore::prefill(&mut db, items, &configs.extract()?, [index].into())?;
         let mut addrs = configs.get_values("addrs")?;
         addrs.truncate(configs.get("big.num-node")?);
         let bench = BenchStorage::new(
@@ -68,11 +89,12 @@ async fn role_bench(configs: Configs, index: u16) -> anyhow::Result<()> {
             configs.extract()?,
             configs.extract()?,
             [index].into(),
-            db.into(),
+            db,
             (0..configs.get("big.num-node")?).collect(),
             cancel,
         );
         try_join!(bench.run(), timeout)?;
     }
+
     Ok(())
 }

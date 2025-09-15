@@ -59,11 +59,18 @@ impl PlainStorage {
         db: &DB,
         items: impl IntoIterator<Item = (StorageKey, Bytes)>,
     ) -> anyhow::Result<()> {
-        let mut batch = WriteBatch::new();
-        for (key, value) in items {
-            batch.put(key.0, &value);
+        let mut items = items.into_iter();
+        let mut batch;
+        while {
+            batch = WriteBatch::new();
+            // wiki says "hundreds of keys"
+            for (key, value) in items.by_ref().take(1000) {
+                batch.put(key.0, &value)
+            }
+            !batch.is_empty()
+        } {
+            db.write(batch)?
         }
-        db.write(batch)?;
         Ok(())
     }
 }

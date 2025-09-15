@@ -435,7 +435,7 @@ impl StorageCore {
         items: impl IntoIterator<Item = (StorageKey, Bytes)>,
         config: &StorageConfig,
         node_indices: Vec<NodeIndex>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Vec<String>> {
         let mut segment_indices = HashSet::new();
         for segment_index in 0..config.num_stripe * config.num_segment_per_stripe() {
             if config
@@ -447,18 +447,31 @@ impl StorageCore {
             }
         }
 
-        let mut batch = WriteBatch::new();
-        for (key, value) in items {
-            let segment_index = config.segment_of(&key);
-            if segment_indices.contains(&segment_index) {
-                let Some(cf) = db.cf_handle(&format!("segment-{segment_index}")) else {
-                    unimplemented!()
-                };
-                batch.put_cf(cf, key.0, &value)
+        let mut items = items.into_iter();
+        let mut batch;
+        while {
+            batch = WriteBatch::new();
+            // wiki says "hundreds of keys"
+            for (key, value) in items.by_ref() {
+                let segment_index = config.segment_of(&key);
+                if segment_indices.contains(&segment_index) {
+                    let Some(cf) = db.cf_handle(&format!("segment-{segment_index}")) else {
+                        unimplemented!()
+                    };
+                    batch.put_cf(cf, key.0, &value);
+                    if batch.len() == 1000 {
+                        break;
+                    }
+                }
             }
+            !batch.is_empty()
+        } {
+            db.write(batch)?
         }
-        db.write(batch)?;
-        Ok(())
+        Ok(segment_indices
+            .into_iter()
+            .map(|i| format!("segment-{i}"))
+            .collect())
     }
 }
 
