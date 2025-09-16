@@ -1,5 +1,6 @@
 use std::{
     collections::VecDeque,
+    mem::replace,
     net::SocketAddr,
     sync::Arc,
     time::{Duration, Instant},
@@ -16,6 +17,7 @@ use tokio::{
     try_join,
 };
 use tokio_util::sync::CancellationToken;
+use tracing::info;
 
 use crate::network::{Mesh, Network, NetworkId};
 
@@ -77,6 +79,8 @@ impl Bench {
         for _ in 0..=self.config.prefetch_offset {
             self.push_command().await?
         }
+        let mut interval_start = Instant::now();
+        let mut interval_start_num_record = 0;
         loop {
             let start;
             let Some((command, key)) = self.command_queue.pop_front() else {
@@ -104,6 +108,16 @@ impl Bench {
             self.records.push((start, duration));
 
             self.push_command().await?;
+
+            let now = Instant::now();
+            let elapsed = now.duration_since(interval_start);
+            if elapsed >= Duration::from_secs(1) {
+                interval_start = now;
+                let interval_num_record = self.records.len()
+                    - replace(&mut interval_start_num_record, self.records.len());
+                let tps = interval_num_record as f64 / elapsed.as_secs_f64();
+                info!("interval tps: {tps:.2}")
+            }
         }
     }
 
