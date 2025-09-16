@@ -32,14 +32,19 @@ class Ssh:
 
 
 def wait_all(tasks, fail_ok=False):
+    num_fail = 0
     for task in tasks:
         try:
             task.wait()
         except RuntimeError:
-            print(f"Task failed on {task.host}")
             if not fail_ok:
+                print(f"Task failed on {task.host}")
                 raise
-    
+            else:
+                num_fail += 1
+    if num_fail:
+        print(f"{num_fail} task(s) failed")
+
 
 def local(cmd, detach=False):
     print(f"[local] {cmd}")

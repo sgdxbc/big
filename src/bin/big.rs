@@ -91,25 +91,17 @@ async fn role_bench(configs: Configs, index: u16) -> anyhow::Result<()> {
         }
     };
     if configs.get("big.plain-storage")? {
-        let db = DB::open_default(temp_dir.path())?;
-        db.put("", "")?;
-        db.get("")?;
-        info!("db ready");
+        let db = open_db(temp_dir.path(), (0x00..=0xff).map(|i| format!("{i:02x}")))?;
         let bench = BenchPlainStorage::new(configs.extract()?, db.into(), cancel);
+        let _ = tx_start.send(());
         try_join!(bench.run(), timeout)?;
     } else {
         let storage_config = configs.extract::<StorageConfig>()?;
         let node_indices = vec![index];
-        let db = DB::open_cf(
-            &Default::default(),
-            temp_dir.path(),
-            storage_config
-                .segments_of(&node_indices)
-                .map(|i| format!("segment-{i}")),
-        )?;
-        db.put("", "")?;
-        db.get("")?;
-        info!("db ready");
+        let cfs = storage_config
+            .segments_of(&node_indices)
+            .map(|i| format!("segment-{i}"));
+        let db = open_db(temp_dir.path(), cfs)?;
 
         let mut addrs = configs.get_values("addrs")?;
         addrs.truncate(configs.get("big.num-node")?);
@@ -128,4 +120,12 @@ async fn role_bench(configs: Configs, index: u16) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn open_db(path: impl AsRef<Path>, cfs: impl Iterator<Item = String>) -> anyhow::Result<DB> {
+    let db = DB::open_cf(&Default::default(), path, cfs)?;
+    db.put("", "")?;
+    db.get("")?;
+    info!("db ready");
+    Ok(db)
 }

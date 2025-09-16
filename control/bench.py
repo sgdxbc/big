@@ -12,8 +12,9 @@ def task(server_hosts):
         wait_all(tasks)
     except:
         server_stop.task(server_hosts)
-        download_logs.task(server_hosts, "big.log")
         raise
+    finally:
+        download_logs.task(server_hosts, "big.log")
 
 
 def override_task(server_hosts, num_faulty_node, plain):

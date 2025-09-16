@@ -2,15 +2,8 @@ from common import *
 
 
 def task(hosts):
-    for host in hosts:
-        try:
-            ssh(host, f"pgrep big && pkill big")
-        except RuntimeError:
-            pass
-        try:
-            ssh(host, f"rm -r /tmp/big*")
-        except RuntimeError:
-            pass
+    wait_all([Ssh(host, "pkill big") for host in hosts], fail_ok=True)
+    wait_all([Ssh(host, "rm -r /tmp/big*") for host in hosts], fail_ok=True)
 
 
 if __name__ == "__main__":
