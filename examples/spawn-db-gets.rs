@@ -31,7 +31,7 @@ async fn main() -> anyhow::Result<()> {
     for index in 0..NUM_KEY {
         let key = uniform_key(index);
         rng.fill(&mut value);
-        db.put(key, &value)?
+        db.put(key, value)?
     }
     let db = Arc::new(db);
     let writes = spawn({
@@ -42,7 +42,7 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 let key = uniform_key(rng.random_range(0..NUM_KEY));
                 rng.fill(&mut value);
-                db.put(key, &value)?;
+                db.put(key, value)?;
                 yield_now().await
             }
             #[allow(unreachable_code)]

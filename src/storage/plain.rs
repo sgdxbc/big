@@ -74,10 +74,10 @@ impl PlainStorage {
             let db = db.clone();
             tasks.spawn(async move { db.write(batch) });
             // not 100% cpu utilization, but more concurrency seems not improving
-            if tasks.len() == std::thread::available_parallelism()?.get() {
-                if let Some(res) = tasks.join_next().await {
-                    res??
-                }
+            if tasks.len() == std::thread::available_parallelism()?.get()
+                && let Some(res) = tasks.join_next().await
+            {
+                res??
             }
         }
         while let Some(res) = tasks.join_next().await {

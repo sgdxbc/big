@@ -175,6 +175,8 @@ impl BenchPlainStorage {
 }
 
 pub struct BenchStorage {
+    tx_mesh_established: oneshot::Sender<()>,
+
     bench: Bench,
     storage: Storage,
     network: Network,
@@ -191,20 +193,20 @@ impl BenchStorage {
         db: Arc<DB>,
         node_table: Vec<NetworkId>,
         cancel: CancellationToken,
+        tx_mesh_established: oneshot::Sender<()>,
     ) -> Self {
-        let (tx_peer, rx_peer) = channel(100);
+        let (tx_connection, rx_connection) = channel(100);
         let (tx_incoming_bytes, rx_incoming_bytes) = channel(100);
         let (tx_outgoing_bytes, rx_outgoing_bytes) = channel(100);
         let (tx_op, rx_op) = channel(1);
 
         let network = Network::new(
-            network_id,
             cancel.clone(),
-            rx_peer,
+            rx_connection,
             rx_outgoing_bytes,
             tx_incoming_bytes,
         );
-        let mesh = Mesh::new(addrs, network_id, tx_peer);
+        let mesh = Mesh::new(addrs, network_id, tx_connection);
         let bench = Bench::new(bench_config, cancel.clone(), tx_op);
         let storage = Storage::new(
             storage_config,
@@ -217,6 +219,7 @@ impl BenchStorage {
             tx_outgoing_bytes,
         );
         Self {
+            tx_mesh_established,
             bench,
             storage,
             network,
@@ -227,6 +230,7 @@ impl BenchStorage {
     pub async fn run(self) -> anyhow::Result<()> {
         let task = async {
             self.mesh.run().await?;
+            let _ = self.tx_mesh_established.send(());
             try_join!(self.bench.run(), self.storage.run())?;
             Ok(())
         };

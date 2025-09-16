@@ -10,7 +10,7 @@ use big::{
 };
 use rocksdb::DB;
 use tempfile::tempdir;
-use tokio::{fs, task::JoinSet, time::sleep, try_join};
+use tokio::{fs, sync::oneshot, task::JoinSet, time::sleep, try_join};
 use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
@@ -67,6 +67,7 @@ addrs   127.0.0.1:5003
             db.clone(),
             (0..configs.get("big.num-node")?).collect(),
             cancel.clone(),
+            oneshot::channel().0, // omit observing establishment for local testing
         );
         tasks.spawn(bench.run());
     }

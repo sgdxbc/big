@@ -3,11 +3,7 @@ from time import sleep
 
 
 def task(hosts):
-    for host in hosts:
-        try:
-            ssh(host, f"pkill -INT big")
-        except RuntimeError:
-            pass
+    wait_all([Ssh(host, "pkill -INT big") for host in hosts], fail_ok=True)
 
 
 if __name__ == "__main__":

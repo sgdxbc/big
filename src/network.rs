@@ -1,10 +1,11 @@
-use std::{collections::HashMap, net::SocketAddr};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use bytes::Bytes;
 use quinn::{Connection, ConnectionError, Endpoint};
 use tokio::{
     select,
     sync::{
+        Barrier,
         mpsc::{Receiver, Sender, channel},
         oneshot,
     },
@@ -18,10 +19,8 @@ use crate::cert::{client_config, server_config};
 pub type NetworkId = u32;
 
 pub struct Network {
-    id: NetworkId,
-
     cancel: CancellationToken,
-    rx_peer: Receiver<(Peer, oneshot::Sender<()>)>,
+    rx_peer: Receiver<(NetworkId, Connection, oneshot::Sender<()>)>,
     rx_message: Receiver<(NetworkId, Bytes)>,
     tx_message: Sender<(NetworkId, Vec<u8>)>,
 
@@ -31,22 +30,15 @@ pub struct Network {
     rx_close: Receiver<NetworkId>,
 }
 
-pub enum Peer {
-    Incoming(Connection),
-    Outgoing(NetworkId, Connection),
-}
-
 impl Network {
     pub fn new(
-        id: NetworkId,
         cancel: CancellationToken,
-        rx_peer: Receiver<(Peer, oneshot::Sender<()>)>,
+        rx_peer: Receiver<(NetworkId, Connection, oneshot::Sender<()>)>,
         rx_message: Receiver<(NetworkId, Bytes)>,
         tx_message: Sender<(NetworkId, Vec<u8>)>,
     ) -> Self {
         let (tx_close, rx_close) = channel(1);
         Self {
-            id,
             cancel,
             rx_peer,
             rx_message,
@@ -69,34 +61,19 @@ impl Network {
     async fn run_inner(&mut self) -> anyhow::Result<()> {
         loop {
             enum Event<R> {
-                Peer((Peer, oneshot::Sender<()>)),
+                Connection((NetworkId, Connection, oneshot::Sender<()>)),
                 Close(NetworkId),
                 Message((NetworkId, Bytes)),
                 TaskResult(R),
             }
             match select! {
-                Some(peer) = self.rx_peer.recv() => Event::Peer(peer),
+                Some(peer) = self.rx_peer.recv() => Event::Connection(peer),
                 Some(id) = self.rx_close.recv() => Event::Close(id),
                 Some(message) = self.rx_message.recv() => Event::Message(message),
                 Some(result) = self.tasks.join_next() => Event::TaskResult(result),
                 else => break,
             } {
-                Event::Peer((peer, tx_ok)) => {
-                    let (id, connection) = match peer {
-                        Peer::Incoming(connection) => {
-                            let mut id = [0; size_of::<NetworkId>()];
-                            connection.accept_uni().await?.read_exact(&mut id).await?;
-                            (NetworkId::from_le_bytes(id), connection)
-                        }
-                        Peer::Outgoing(id, connection) => {
-                            connection
-                                .open_uni()
-                                .await?
-                                .write_all(&self.id.to_le_bytes())
-                                .await?;
-                            (id, connection)
-                        }
-                    };
+                Event::Connection((id, connection, tx_ok)) => {
                     self.handle_connection(id, connection);
                     let _ = tx_ok.send(());
                 }
@@ -176,16 +153,20 @@ pub struct Mesh {
     addrs: Vec<SocketAddr>,
     id: NetworkId,
 
-    tx_peer: Sender<(Peer, oneshot::Sender<()>)>,
+    tx_connection: Sender<(NetworkId, Connection, oneshot::Sender<()>)>,
 }
 
 impl Mesh {
     pub fn new(
         addrs: Vec<SocketAddr>,
         id: NetworkId,
-        tx_peer: Sender<(Peer, oneshot::Sender<()>)>,
+        tx_connection: Sender<(NetworkId, Connection, oneshot::Sender<()>)>,
     ) -> Self {
-        Self { addrs, id, tx_peer }
+        Self {
+            addrs,
+            id,
+            tx_connection,
+        }
     }
 
     pub async fn run(self) -> anyhow::Result<()> {
@@ -193,28 +174,47 @@ impl Mesh {
         endpoint.set_default_client_config(client_config());
         let mut tasks = JoinSet::new();
         let num_connection = self.addrs.len() - 1;
+        let barrier = Arc::new(Barrier::new(self.id as usize + 1));
         for (remote_id, addr) in self.addrs.into_iter().take(self.id as _).enumerate() {
             let endpoint = endpoint.clone();
-            let tx_peer = self.tx_peer.clone();
+            let tx_connection = self.tx_connection.clone();
+            let id = self.id;
+            let barrier = barrier.clone();
             tasks.spawn(async move {
                 let connection = endpoint.connect(addr, "server.example")?.await?;
+                barrier.wait().await;
+                connection
+                    .open_uni()
+                    .await?
+                    .write_all(&id.to_le_bytes())
+                    .await?;
                 let (tx_ok, rx_ok) = oneshot::channel();
-                let _ = tx_peer
-                    .send((Peer::Outgoing(remote_id as _, connection), tx_ok))
+                let _ = tx_connection
+                    .send((remote_id as _, connection, tx_ok))
                     .await;
                 let _ = rx_ok.await;
                 anyhow::Ok(())
             });
         }
         tasks.spawn(async move {
+            let mut connections = Vec::new();
             for _ in 0..num_connection - self.id as usize {
                 let connection = endpoint
                     .accept()
                     .await
                     .ok_or(anyhow::format_err!("endpoint closed"))?
                     .await?;
+                connections.push(connection)
+            }
+            barrier.wait().await;
+            for connection in connections {
+                let mut id = [0; size_of::<NetworkId>()];
+                connection.accept_uni().await?.read_exact(&mut id).await?;
                 let (tx_ok, rx_ok) = oneshot::channel();
-                let _ = self.tx_peer.send((Peer::Incoming(connection), tx_ok)).await;
+                let _ = self
+                    .tx_connection
+                    .send((NetworkId::from_le_bytes(id), connection, tx_ok))
+                    .await;
                 let _ = rx_ok.await;
             }
             Ok(())

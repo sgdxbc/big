@@ -11,7 +11,7 @@ use big::{
 };
 use rocksdb::{DB, Options};
 use tempfile::TempDir;
-use tokio::{process::Command, time::sleep, try_join};
+use tokio::{process::Command, sync::oneshot, time::sleep, try_join};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
@@ -80,9 +80,11 @@ async fn role_bench(configs: Configs, index: u16) -> anyhow::Result<()> {
     }
 
     let cancel = CancellationToken::new();
+    let (tx_start, rx_start) = oneshot::channel();
     let timeout = {
         let cancel = cancel.clone();
         async move {
+            let _ = rx_start.await;
             sleep(Duration::from_secs(10)).await;
             cancel.cancel();
             anyhow::Ok(())
@@ -120,6 +122,7 @@ async fn role_bench(configs: Configs, index: u16) -> anyhow::Result<()> {
             db.into(),
             (0..configs.get("big.num-node")?).collect(),
             cancel,
+            tx_start,
         );
         try_join!(bench.run(), timeout)?;
     }
