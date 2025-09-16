@@ -58,7 +58,7 @@ pub enum StorageOp {
     Prefetch(StorageKey, oneshot::Sender<()>), // same reason as Bump
 }
 
-type SegmentIndex = u32;
+pub type SegmentIndex = u32;
 type StripeIndex = u32;
 
 #[derive(Clone)]
@@ -110,6 +110,13 @@ impl StorageConfig {
                 .into_iter()
                 .map(move |index| index + (index >= primary) as NodeIndex),
         )
+    }
+
+    pub fn segments_of(&self, node_indices: &[NodeIndex]) -> impl Iterator<Item = SegmentIndex> {
+        (0..self.num_stripe * self.num_segment_per_stripe()).filter(move |&segment_index| {
+            self.nodes_of(segment_index)
+                .any(|node_index| node_indices.contains(&node_index))
+        })
     }
 }
 
@@ -435,16 +442,10 @@ impl StorageCore {
         items: impl IntoIterator<Item = (StorageKey, Bytes)>,
         config: &StorageConfig,
         node_indices: Vec<NodeIndex>,
-    ) -> anyhow::Result<Vec<String>> {
-        let mut segment_indices = HashSet::new();
-        for segment_index in 0..config.num_stripe * config.num_segment_per_stripe() {
-            if config
-                .nodes_of(segment_index)
-                .any(|node_index| node_indices.contains(&node_index))
-            {
-                segment_indices.insert(segment_index);
-                db.create_cf(format!("segment-{segment_index}"), &Default::default())?
-            }
+    ) -> anyhow::Result<()> {
+        let segment_indices = config.segments_of(&node_indices).collect::<HashSet<_>>();
+        for segment_index in &segment_indices {
+            db.create_cf(format!("segment-{segment_index}"), &Default::default())?
         }
 
         let mut items = items.into_iter();
@@ -468,10 +469,7 @@ impl StorageCore {
         } {
             db.write(batch)?
         }
-        Ok(segment_indices
-            .into_iter()
-            .map(|i| format!("segment-{i}"))
-            .collect())
+        Ok(())
     }
 }
 

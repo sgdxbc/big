@@ -107,7 +107,7 @@ resource "aws_instance" "server" {
   key_name               = aws_key_pair.main.key_name
 
   root_block_device {
-    volume_size = 20
+    volume_size = 40
   }
 }
 

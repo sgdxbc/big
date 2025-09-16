@@ -29,12 +29,6 @@ def override_task(server_hosts, num_faulty_node, plain):
 
 if __name__ == "__main__":
     import clusters
-    import sys
 
-    argv = dict(enumerate(sys.argv))
     server_hosts = [item["host"] for item in clusters.server]
-    if argv.get(1) == "plain":
-        override_task(server_hosts, 0, True)
-    elif num_faulty_node := argv.get(1):
-        override_task(server_hosts, int(num_faulty_node), False)
     task(server_hosts)

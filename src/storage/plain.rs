@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use rocksdb::{DB, WriteBatch};
-use tokio::sync::mpsc::Receiver;
+use tokio::{sync::mpsc::Receiver, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use super::{StorageKey, StorageOp};
@@ -55,12 +55,14 @@ impl PlainStorage {
         Ok(())
     }
 
-    pub fn prefill(
-        db: &DB,
+    pub async fn prefill(
+        db: impl Into<Arc<DB>>,
         items: impl IntoIterator<Item = (StorageKey, Bytes)>,
     ) -> anyhow::Result<()> {
         let mut items = items.into_iter();
         let mut batch;
+        let mut tasks = JoinSet::new();
+        let db = db.into();
         while {
             batch = WriteBatch::new();
             // wiki says "hundreds of keys"
@@ -69,7 +71,17 @@ impl PlainStorage {
             }
             !batch.is_empty()
         } {
-            db.write(batch)?
+            let db = db.clone();
+            tasks.spawn(async move { db.write(batch) });
+            // not 100% cpu utilization, but more concurrency seems not improving
+            if tasks.len() == std::thread::available_parallelism()?.get() {
+                if let Some(res) = tasks.join_next().await {
+                    res??
+                }
+            }
+        }
+        while let Some(res) = tasks.join_next().await {
+            res??
         }
         Ok(())
     }

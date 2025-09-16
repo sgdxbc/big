@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use big::{
     logging::init_logging,
@@ -28,12 +28,12 @@ big.prefetch-offset 0
 
     let temp_dir = tempdir()?;
     println!("{}", temp_dir.path().display());
-    let db = DB::open_default(temp_dir.path())?;
-    PlainStorage::prefill(&db, Bench::prefill_items(configs.extract()?))?;
+    let db = Arc::new(DB::open_default(temp_dir.path())?);
+    PlainStorage::prefill(db.clone(), Bench::prefill_items(configs.extract()?)).await?;
     println!("db prefilled");
 
     let cancel = CancellationToken::new();
-    let bench = BenchPlainStorage::new(configs.extract()?, db.into(), cancel.clone());
+    let bench = BenchPlainStorage::new(configs.extract()?, db, cancel.clone());
     let timeout = async {
         sleep(Duration::from_secs(10)).await;
         cancel.cancel();
