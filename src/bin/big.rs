@@ -6,7 +6,7 @@ use big::{
     storage::{
         StorageConfig, StorageCore,
         bench::{Bench, BenchPlainStorage, BenchStorage},
-        plain::PlainStorage,
+        plain::PlainSyncStorage,
     },
 };
 use rocksdb::{DB, Options};
@@ -54,7 +54,7 @@ async fn role_prefill(configs: Configs, index: u16) -> anyhow::Result<()> {
     let mut db = DB::open(&options, path)?;
     let items = Bench::prefill_items(configs.extract()?);
     if configs.get("big.plain-storage")? {
-        PlainStorage::prefill(db, items).await
+        PlainSyncStorage::prefill(db, items).await
     } else {
         StorageCore::prefill(&mut db, items, &configs.extract()?, [index].into())
     }

@@ -22,7 +22,7 @@ use tracing::info;
 use crate::network::{Mesh, Network, NetworkId};
 
 use super::{
-    NodeIndex, StateVersion, Storage, StorageConfig, StorageKey, StorageOp, plain::PlainStorage,
+    NodeIndex, StateVersion, Storage, StorageConfig, StorageKey, StorageOp, plain::PlainSyncStorage,
 };
 
 pub struct BenchConfig {
@@ -155,14 +155,14 @@ impl Bench {
 
 pub struct BenchPlainStorage {
     bench: Bench,
-    plain_storage: PlainStorage,
+    plain_storage: PlainSyncStorage,
 }
 
 impl BenchPlainStorage {
     pub fn new(config: BenchConfig, db: Arc<DB>, cancel: CancellationToken) -> Self {
         let (tx_op, rx_op) = channel(1);
         let bench = Bench::new(config, cancel.clone(), tx_op);
-        let plain_storage = PlainStorage::new(db, cancel, rx_op);
+        let plain_storage = PlainSyncStorage::new(db, cancel, rx_op);
         Self {
             bench,
             plain_storage,
