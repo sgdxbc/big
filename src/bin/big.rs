@@ -6,7 +6,7 @@ use big::{
     storage::{
         StorageConfig, StorageCore,
         bench::{Bench, BenchPlainStorage, BenchStorage},
-        plain::PlainSyncStorage,
+        plain::PlainStorage,
     },
 };
 use rocksdb::{DB, Options};
@@ -54,7 +54,7 @@ async fn role_prefill(configs: Configs, index: u16) -> anyhow::Result<()> {
     let mut db = DB::open(&options, path)?;
     let items = Bench::prefill_items(configs.extract()?);
     if configs.get("big.plain-storage")? {
-        PlainSyncStorage::prefill(db, items).await
+        PlainStorage::prefill(db, items).await
     } else {
         StorageCore::prefill(&mut db, items, &configs.extract()?, [index].into())
     }
@@ -96,7 +96,7 @@ async fn role_bench(configs: Configs, index: u16) -> anyhow::Result<()> {
     options.enable_statistics();
     if configs.get("big.plain-storage")? {
         db = Arc::new(DB::open(&options, temp_dir.path())?);
-        let bench = BenchPlainStorage::new(configs.extract()?, db.clone(), cancel);
+        let bench = BenchPlainStorage::new(true, configs.extract()?, db.clone(), cancel);
         let _ = tx_start.send(());
         try_join!(bench.run(), timeout)?;
     } else {

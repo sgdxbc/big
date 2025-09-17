@@ -76,38 +76,6 @@ impl PlainSyncStorage {
         }
         Ok(())
     }
-
-    pub async fn prefill(
-        db: DB,
-        items: impl IntoIterator<Item = (StorageKey, Bytes)>,
-    ) -> anyhow::Result<()> {
-        let mut items = items.into_iter();
-        let mut batch;
-        let mut tasks = JoinSet::new();
-        let db = Arc::new(db);
-        while {
-            batch = WriteBatch::new();
-            // wiki says "hundreds of keys"
-            for (key, value) in items.by_ref().take(1000) {
-                batch.put(key.0, &value)
-            }
-            !batch.is_empty()
-        } {
-            let db = db.clone();
-            tasks.spawn(async move { db.write(batch) });
-            // not 100% cpu utilization, but more concurrency seems not improving
-            if tasks.len() == std::thread::available_parallelism()?.get()
-                && let Some(res) = tasks.join_next().await
-            {
-                res??
-            }
-        }
-        while let Some(res) = tasks.join_next().await {
-            res??
-        }
-        db.compact_range::<&[u8], &[u8]>(None, None);
-        Ok(())
-    }
 }
 
 pub struct PlainPrefetchStorage {
@@ -247,6 +215,40 @@ impl PlainPrefetchStorage {
                 }
             }
         }
+        Ok(())
+    }
+}
+
+impl PlainStorage {
+    pub async fn prefill(
+        db: DB,
+        items: impl IntoIterator<Item = (StorageKey, Bytes)>,
+    ) -> anyhow::Result<()> {
+        let mut items = items.into_iter();
+        let mut batch;
+        let mut tasks = JoinSet::new();
+        let db = Arc::new(db);
+        while {
+            batch = WriteBatch::new();
+            // wiki says "hundreds of keys"
+            for (key, value) in items.by_ref().take(1000) {
+                batch.put(key.0, &value)
+            }
+            !batch.is_empty()
+        } {
+            let db = db.clone();
+            tasks.spawn(async move { db.write(batch) });
+            // not 100% cpu utilization, but more concurrency seems not improving
+            if tasks.len() == std::thread::available_parallelism()?.get()
+                && let Some(res) = tasks.join_next().await
+            {
+                res??
+            }
+        }
+        while let Some(res) = tasks.join_next().await {
+            res??
+        }
+        db.compact_range::<&[u8], &[u8]>(None, None);
         Ok(())
     }
 }

@@ -5,7 +5,7 @@ use big::{
     parse::Configs,
     storage::{
         bench::{Bench, BenchPlainStorage},
-        plain::PlainSyncStorage,
+        plain::PlainStorage,
     },
 };
 use rocksdb::DB;
@@ -29,12 +29,12 @@ bench.prefetch-offset 0
     let temp_dir = tempdir()?;
     println!("{}", temp_dir.path().display());
     let db = DB::open_default(temp_dir.path())?;
-    PlainSyncStorage::prefill(db, Bench::prefill_items(configs.extract()?)).await?;
+    PlainStorage::prefill(db, Bench::prefill_items(configs.extract()?)).await?;
     println!("db prefilled");
     let db = DB::open_default(temp_dir.path())?;
 
     let cancel = CancellationToken::new();
-    let bench = BenchPlainStorage::new(configs.extract()?, db.into(), cancel.clone());
+    let bench = BenchPlainStorage::new(false, configs.extract()?, db.into(), cancel.clone());
     let timeout = async {
         sleep(Duration::from_secs(10)).await;
         cancel.cancel();

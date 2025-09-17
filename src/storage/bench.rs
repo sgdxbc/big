@@ -19,10 +19,12 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use crate::network::{Mesh, Network, NetworkId};
+use crate::{network::NetworkId, storage::plain::PlainPrefetchStorage};
 
 use super::{
-    NodeIndex, StateVersion, Storage, StorageConfig, StorageKey, StorageOp, plain::PlainSyncStorage,
+    NodeIndex, StateVersion, StorageConfig, StorageKey, StorageOp,
+    network::Storage,
+    plain::{PlainStorage, PlainSyncStorage},
 };
 
 pub struct BenchConfig {
@@ -155,33 +157,43 @@ impl Bench {
 
 pub struct BenchPlainStorage {
     bench: Bench,
-    plain_storage: PlainSyncStorage,
+    plain_storage: PlainStorage,
 }
 
 impl BenchPlainStorage {
-    pub fn new(config: BenchConfig, db: Arc<DB>, cancel: CancellationToken) -> Self {
+    pub fn new(
+        prefetch: bool,
+        config: BenchConfig,
+        db: Arc<DB>,
+        cancel: CancellationToken,
+    ) -> Self {
         let (tx_op, rx_op) = channel(1);
-        let bench = Bench::new(config, cancel.clone(), tx_op);
-        let plain_storage = PlainSyncStorage::new(db, cancel, rx_op);
+        let plain_storage = if prefetch {
+            PlainStorage::Prefetch(PlainPrefetchStorage::new(
+                db,
+                config.prefetch_offset,
+                cancel.clone(),
+                rx_op,
+            ))
+        } else {
+            PlainStorage::Sync(PlainSyncStorage::new(db, cancel.clone(), rx_op))
+        };
+        let bench = Bench::new(config, cancel, tx_op);
         Self {
             bench,
             plain_storage,
         }
     }
 
-    pub async fn run(mut self) -> anyhow::Result<()> {
+    pub async fn run(self) -> anyhow::Result<()> {
         try_join!(self.plain_storage.run(), self.bench.run())?;
         Ok(())
     }
 }
 
 pub struct BenchStorage {
-    tx_mesh_established: oneshot::Sender<()>,
-
     bench: Bench,
     storage: Storage,
-    network: Network,
-    mesh: Mesh,
 }
 
 impl BenchStorage {
@@ -194,48 +206,27 @@ impl BenchStorage {
         db: Arc<DB>,
         node_table: Vec<NetworkId>,
         cancel: CancellationToken,
-        tx_mesh_established: oneshot::Sender<()>,
+        tx_start: oneshot::Sender<()>,
     ) -> Self {
-        let (tx_connection, rx_connection) = channel(100);
-        let (tx_incoming_bytes, rx_incoming_bytes) = channel(100);
-        let (tx_outgoing_bytes, rx_outgoing_bytes) = channel(100);
         let (tx_op, rx_op) = channel(1);
 
-        let network = Network::new(
-            cancel.clone(),
-            rx_connection,
-            rx_outgoing_bytes,
-            tx_incoming_bytes,
-        );
-        let mesh = Mesh::new(addrs, network_id, tx_connection);
         let bench = Bench::new(bench_config, cancel.clone(), tx_op);
         let storage = Storage::new(
             storage_config,
             node_indices,
             db,
             node_table,
-            cancel.clone(),
+            addrs,
+            network_id,
+            cancel,
             rx_op,
-            rx_incoming_bytes,
-            tx_outgoing_bytes,
+            tx_start,
         );
-        Self {
-            tx_mesh_established,
-            bench,
-            storage,
-            network,
-            mesh,
-        }
+        Self { bench, storage }
     }
 
     pub async fn run(self) -> anyhow::Result<()> {
-        let task = async {
-            self.mesh.run().await?;
-            let _ = self.tx_mesh_established.send(());
-            try_join!(self.bench.run(), self.storage.run())?;
-            Ok(())
-        };
-        try_join!(self.network.run(), task)?;
+        try_join!(self.storage.run(), self.bench.run())?;
         Ok(())
     }
 }
