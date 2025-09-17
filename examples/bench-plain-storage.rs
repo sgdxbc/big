@@ -22,7 +22,7 @@ async fn main() -> anyhow::Result<()> {
         "
 bench.num-key       1000000
 bench.put-ratio     0.5
-big.prefetch-offset 0
+bench.prefetch-offset 0
 ",
     );
 

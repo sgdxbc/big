@@ -33,21 +33,15 @@ impl PlainStorage {
         while let Some(op) = self.rx_op.recv().await {
             match op {
                 StorageOp::Fetch(key, tx_value) => {
-                    let Some(cf) = self.db.cf_handle(&format!("{:02x}", key.0[0])) else {
-                        anyhow::bail!("missing column family")
-                    };
-                    let value = self.db.get_cf(cf, key.0)?;
+                    let value = self.db.get(key.0)?;
                     let _ = tx_value.send(value.map(Bytes::from));
                 }
                 StorageOp::Bump(updates, tx_ok) => {
                     let mut batch = WriteBatch::new();
                     for (key, value) in updates {
-                        let Some(cf) = self.db.cf_handle(&format!("{:02x}", key.0[0])) else {
-                            anyhow::bail!("missing column family")
-                        };
                         match value {
-                            Some(value) => batch.put_cf(cf, key.0, &value),
-                            None => batch.delete_cf(cf, key.0),
+                            Some(value) => batch.put(key.0, &value),
+                            None => batch.delete(key.0),
                         }
                     }
                     self.db.write(batch)?;
@@ -62,13 +56,10 @@ impl PlainStorage {
     }
 
     pub async fn prefill(
-        mut db: DB,
+        db: DB,
         items: impl IntoIterator<Item = (StorageKey, Bytes)>,
     ) -> anyhow::Result<()> {
         let mut items = items.into_iter();
-        for i in 0x00..=0xff {
-            db.create_cf(format!("{i:02x}"), &Default::default())?
-        }
         let mut batch;
         let mut tasks = JoinSet::new();
         let db = Arc::new(db);
@@ -76,10 +67,7 @@ impl PlainStorage {
             batch = WriteBatch::new();
             // wiki says "hundreds of keys"
             for (key, value) in items.by_ref().take(1000) {
-                let Some(cf) = db.cf_handle(&format!("{:02x}", key.0[0])) else {
-                    unimplemented!()
-                };
-                batch.put_cf(cf, key.0, &value)
+                batch.put(key.0, &value)
             }
             !batch.is_empty()
         } {
@@ -95,6 +83,7 @@ impl PlainStorage {
         while let Some(res) = tasks.join_next().await {
             res??
         }
+        db.compact_range::<&[u8], &[u8]>(None, None);
         Ok(())
     }
 }

@@ -97,7 +97,8 @@ impl Bench {
                     start = Instant::now();
                     let (tx_value, rx_value) = oneshot::channel();
                     let _ = self.tx_op.send(StorageOp::Fetch(key, tx_value)).await;
-                    rx_value.await?;
+                    let value = rx_value.await?;
+                    anyhow::ensure!(value.is_some(), "key not found");
                     Default::default()
                 }
             };
@@ -127,7 +128,7 @@ impl Bench {
         } else {
             Command::Get
         };
-        let key = Self::uniform_key(self.rng.random_range(0..=self.config.num_key));
+        let key = Self::uniform_key(self.rng.random_range(0..self.config.num_key));
         if matches!(command, Command::Get) {
             let (tx_ok, rx_ok) = oneshot::channel();
             let _ = self.tx_op.send(StorageOp::Prefetch(key, tx_ok)).await;
@@ -249,7 +250,7 @@ mod parse {
             Ok(Self {
                 num_key: configs.get("bench.num-key")?,
                 put_ratio: configs.get("bench.put-ratio")?,
-                prefetch_offset: configs.get("big.prefetch-offset")?,
+                prefetch_offset: configs.get("bench.prefetch-offset")?,
             })
         }
     }

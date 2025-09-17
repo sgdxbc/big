@@ -632,7 +632,7 @@ mod parse {
                 num_faulty_node: configs.get("big.num-faulty-node")?,
                 num_stripe: configs.get("big.num-stripe")?,
                 num_backup: configs.get("big.num-backup")?,
-                prefetch_offset: configs.get("big.prefetch-offset")?,
+                prefetch_offset: configs.get("bench.prefetch-offset")?,
             })
         }
     }

@@ -1,4 +1,4 @@
-use std::{env::args, fs, path::Path, time::Duration};
+use std::{env::args, fs, path::Path, sync::Arc, time::Duration};
 
 use big::{
     logging::init_logging_file,
@@ -44,12 +44,13 @@ async fn role_prefill(configs: Configs, index: u16) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let path = Path::new("big-db-prefill");
+    let path = Path::new("/tmp/big-db-prefill");
     let _ = fs::remove_dir_all(path);
     fs::create_dir(path)?;
     let mut options = Options::default();
     options.prepare_for_bulk_load();
     options.create_if_missing(true);
+    options.set_max_subcompactions(std::thread::available_parallelism()?.get() as _);
     let mut db = DB::open(&options, path)?;
     let items = Bench::prefill_items(configs.extract()?);
     if configs.get("big.plain-storage")? {
@@ -66,7 +67,7 @@ async fn role_bench(configs: Configs, index: u16) -> anyhow::Result<()> {
     }
 
     let temp_dir = TempDir::with_prefix("big-db.")?;
-    let prefill_path = Path::new("big-db-prefill");
+    let prefill_path = Path::new("/tmp/big-db-prefill");
     if prefill_path.exists() {
         info!("copying prefill db");
         let status = Command::new("cp")
@@ -90,9 +91,12 @@ async fn role_bench(configs: Configs, index: u16) -> anyhow::Result<()> {
             anyhow::Ok(())
         }
     };
+    let db;
+    let mut options = Options::default();
+    options.enable_statistics();
     if configs.get("big.plain-storage")? {
-        let db = open_db(temp_dir.path(), (0x00..=0xff).map(|i| format!("{i:02x}")))?;
-        let bench = BenchPlainStorage::new(configs.extract()?, db.into(), cancel);
+        db = Arc::new(DB::open(&options, temp_dir.path())?);
+        let bench = BenchPlainStorage::new(configs.extract()?, db.clone(), cancel);
         let _ = tx_start.send(());
         try_join!(bench.run(), timeout)?;
     } else {
@@ -101,7 +105,7 @@ async fn role_bench(configs: Configs, index: u16) -> anyhow::Result<()> {
         let cfs = storage_config
             .segments_of(&node_indices)
             .map(|i| format!("segment-{i}"));
-        let db = open_db(temp_dir.path(), cfs)?;
+        db = Arc::new(open_db(temp_dir.path(), cfs)?);
 
         let mut addrs = configs.get_values("addrs")?;
         addrs.truncate(configs.get("big.num-node")?);
@@ -111,18 +115,24 @@ async fn role_bench(configs: Configs, index: u16) -> anyhow::Result<()> {
             configs.extract()?,
             storage_config,
             node_indices,
-            db.into(),
+            db.clone(),
             (0..configs.get("big.num-node")?).collect(),
             cancel,
             tx_start,
         );
         try_join!(bench.run(), timeout)?;
     }
+    if let Some(stats) = db.property_value("rocksdb.stats")? {
+        info!("rocksdb.stats\n{stats}")
+    }
+    if let Some(stats) = db.property_value("rocksdb.options-statistics")? {
+        info!("rocksdb.options-statistics\n{stats}")
+    }
 
     Ok(())
 }
 
-fn open_db(path: impl AsRef<Path>, cfs: impl Iterator<Item = String>) -> anyhow::Result<DB> {
+fn open_db(path: impl AsRef<Path>, cfs: impl IntoIterator<Item = String>) -> anyhow::Result<DB> {
     let db = DB::open_cf(&Default::default(), path, cfs)?;
     db.put("", "")?;
     db.get("")?;

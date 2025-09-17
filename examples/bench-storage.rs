@@ -20,14 +20,14 @@ async fn main() -> anyhow::Result<()> {
     let mut configs = Configs::new();
     configs.parse(
         "
-bench.num-key   1000000
-bench.put-ratio 0.5
+bench.num-key           1000000
+bench.put-ratio         0.5
+bench.prefetch-offset   10
 
 big.num-node            4
 big.num-faulty-node     1
 big.num-stripe          10
 big.num-backup          1
-big.prefetch-offset     10
 
 addrs   127.0.0.1:5000
 addrs   127.0.0.1:5001

@@ -7,14 +7,15 @@ use rand::{Rng as _, SeedableRng, rngs::StdRng};
 use rocksdb::DB;
 use tempfile::tempdir;
 use tokio::{
+    process::Command,
     spawn,
-    sync::oneshot,
     task::{JoinSet, yield_now},
 };
 
 #[derive(Debug, Clone, Copy)]
 enum Mode {
     Inline,
+    #[allow(unused)]
     Spawn,
     SpawnSnapshot,
 }
@@ -25,14 +26,15 @@ const NUM_KEY: u64 = 1_000_000;
 async fn main() -> anyhow::Result<()> {
     let temp_dir = tempdir()?;
     println!("{}", temp_dir.path().display());
+    let status = Command::new("cp")
+        .arg("-rT")
+        .arg("/tmp/big-db-prefill/")
+        .arg(temp_dir.path())
+        .status()
+        .await?;
+    anyhow::ensure!(status.success(), "cp failed: {status}");
     let db = DB::open_default(temp_dir.path())?;
-    let mut value = [0; 68];
-    let mut rng = rand::rng();
-    for index in 0..NUM_KEY {
-        let key = uniform_key(index);
-        rng.fill(&mut value);
-        db.put(key, value)?
-    }
+
     let db = Arc::new(db);
     let writes = spawn({
         let db = db.clone();
@@ -51,10 +53,10 @@ async fn main() -> anyhow::Result<()> {
     });
 
     eprintln!("mode,task_size,concurrency,num_task,total_secs,mean_latency_secs");
-    for task_size in [1, 5, 10, 15] {
+    for task_size in [1, 5] {
         bench(Mode::Inline, task_size, 1, db.clone()).await?;
-        for concurrency in [1, 2, 3, 4, 8, 16] {
-            bench(Mode::Spawn, task_size, concurrency, db.clone()).await?;
+        for concurrency in [1, 2, 3, 4, 8, 16, 32, 64] {
+            // bench(Mode::Spawn, task_size, concurrency, db.clone()).await?;
             bench(Mode::SpawnSnapshot, task_size, concurrency, db.clone()).await?;
         }
     }
@@ -115,11 +117,10 @@ async fn bench(
             }
         }
         Mode::SpawnSnapshot => {
-            let task = |start: Instant, tx_ready: oneshot::Sender<()>| {
+            let task = |start: Instant| {
                 let db = db.clone();
                 async move {
                     let snapshot = db.snapshot();
-                    let _ = tx_ready.send(());
                     let mut rng = StdRng::from_rng(&mut rand::rng());
                     for _ in 0..task_size {
                         let key = uniform_key(rng.random_range(0..NUM_KEY));
@@ -132,18 +133,14 @@ async fn bench(
             };
             let mut tasks = JoinSet::new();
             for _ in 0..concurrency {
-                let (tx_ready, rx_ready) = oneshot::channel();
-                tasks.spawn(task(Instant::now(), tx_ready));
-                rx_ready.await?
+                tasks.spawn(task(Instant::now()));
             }
             for _ in 0..num_task - concurrency {
                 let Some(res) = tasks.join_next().await else {
                     unreachable!()
                 };
                 latencies.push(res??.elapsed());
-                let (tx_ready, rx_ready) = oneshot::channel();
-                tasks.spawn(task(Instant::now(), tx_ready));
-                rx_ready.await?
+                tasks.spawn(task(Instant::now()));
             }
             while let Some(res) = tasks.join_next().await {
                 latencies.push(res??.elapsed())
