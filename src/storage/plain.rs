@@ -12,6 +12,7 @@ use tokio::{
     task::JoinSet,
 };
 use tokio_util::sync::CancellationToken;
+use tracing::debug;
 
 use super::{StateVersion, StorageKey, StorageOp};
 
@@ -146,6 +147,7 @@ impl PlainPrefetchStorage {
                             let _ = tx_value.send(entry.value.clone());
                             continue;
                         }
+                        debug!("prefetch not complete in time");
                         let replaced = self.fetch_tx_values.insert(storage_key, tx_value);
                         anyhow::ensure!(replaced.is_none(), "duplicate fetch for the same key")
                     }
