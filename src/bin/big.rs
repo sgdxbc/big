@@ -68,17 +68,15 @@ async fn role_bench(configs: Configs, index: u16) -> anyhow::Result<()> {
 
     let temp_dir = TempDir::with_prefix("big-db.")?;
     let prefill_path = Path::new("/tmp/big-db-prefill");
-    if prefill_path.exists() {
-        info!("copying prefill db");
-        let status = Command::new("cp")
-            .arg("-rT")
-            .arg(prefill_path)
-            .arg(temp_dir.path())
-            .status()
-            .await?;
-        anyhow::ensure!(status.success());
-        info!("prefill done")
-    }
+    info!("copying prefill db");
+    let status = Command::new("cp")
+        .arg("-rT")
+        .arg(prefill_path)
+        .arg(temp_dir.path())
+        .status()
+        .await?;
+    anyhow::ensure!(status.success());
+    info!("prefill done");
 
     let cancel = CancellationToken::new();
     let (tx_start, rx_start) = oneshot::channel();

@@ -23,7 +23,17 @@ Host *.compute.amazonaws.com
         )
 
 
-def task(hosts):
+def storage_task(hosts):
+    for host in hosts:
+        try:
+            ssh(host, "mount | grep /tmp")
+        except:
+            ssh(host, "sudo mkfs.xfs -f /dev/nvme1n1")
+            ssh(host, "sudo mount -o discard /dev/nvme1n1 /tmp")
+            ssh(host, "sudo chmod 777 /tmp")
+
+
+def common_task(hosts):
     addr_conf = "\n".join(
         f"addrs {item['ip']}:{service_port}" for item in clusters.server
     )
@@ -37,4 +47,5 @@ def task(hosts):
 
 if __name__ == "__main__":
     build_task(clusters.client[0]["host"])
-    task([item["host"] for item in clusters.server + clusters.client])
+    storage_task([item["host"] for item in clusters.server])
+    common_task([item["host"] for item in clusters.server + clusters.client])

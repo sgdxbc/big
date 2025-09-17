@@ -25,7 +25,9 @@ client = run_terraform("client")
 
 
 if __name__ == "__main__":
-    from pprint import pprint as print
-
-    print(server)
-    print(client)
+    print("client")
+    for instance in client:
+        print(f"{instance['host']:<60}{instance['ip']}")
+    print("server")
+    for instance in server:
+        print(f"{instance['host']:<60}{instance['ip']}")

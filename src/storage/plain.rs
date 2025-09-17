@@ -211,6 +211,8 @@ impl PlainPrefetchStorage {
                     if let Some(tx_value) = self.fetch_tx_values.remove(&storage_key) {
                         let _ = tx_value.send(active_entry.value.clone());
                     }
+                    self.active_versioned_keys
+                        .push(Reverse((active_entry.version, storage_key)));
                     entry.insert_entry(active_entry);
                 }
             }
