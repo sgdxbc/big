@@ -4,14 +4,17 @@ import clusters
 
 
 def build_task(build_host):
-    ssh(
+    Ssh(
         build_host,
         "/bin/bash -l -c 'which cargo' || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --profile minimal -y",
-    )
-    ssh(build_host, "/bin/bash -l -c 'which cc' || (sudo apt-get update && sudo apt-get install -y clang make)")
+    ).wait()
+    Ssh(
+        build_host,
+        "/bin/bash -l -c 'which cc' || (sudo apt-get update && sudo apt-get install -y clang make)",
+    ).wait()
     if login_key:
-        local(f"rsync -a {login_key} {build_host}:.ssh/id_ed25519")
-        write_file(
+        Local(f"rsync -a {login_key} {build_host}:.ssh/id_ed25519").wait()
+        WriteRemote(
             build_host,
             ".ssh/config",
             """
@@ -20,17 +23,17 @@ Host *.compute.amazonaws.com
     UserKnownHostsFile=/dev/null
     LogLevel Quiet
 """,
-        )
+        ).wait()
 
 
 def storage_task(hosts):
     for host in hosts:
         try:
-            ssh(host, "mount | grep /tmp")
+            Ssh(host, "mount | grep /tmp").wait()
         except:
-            ssh(host, "sudo mkfs.xfs -f /dev/nvme1n1")
-            ssh(host, "sudo mount -o discard /dev/nvme1n1 /tmp")
-            ssh(host, "sudo chmod 777 /tmp")
+            Ssh(host, "sudo mkfs.xfs -f /dev/nvme1n1").wait()
+            Ssh(host, "sudo mount -o discard /dev/nvme1n1 /tmp").wait()
+            Ssh(host, "sudo chmod 777 /tmp").wait()
 
 
 def common_task(hosts):
@@ -38,14 +41,18 @@ def common_task(hosts):
         f"addrs {item['ip']}:{service_port}" for item in clusters.server
     )
 
-    for host in hosts:
-        ssh(host, f"mkdir -p {deploy_dir}/big-configs")
-        write_file(host, f"{deploy_dir}/big-configs/addr.conf", addr_conf)
-        if nfs:
-            break
+    join([Ssh(host, f"mkdir -p {deploy_dir}/big-configs") for host in hosts])
+    join(
+        [
+            WriteRemote(host, f"{deploy_dir}/big-configs/addr.conf", addr_conf)
+            for host in hosts
+        ]
+    )
 
 
 if __name__ == "__main__":
-    build_task(clusters.client[0]["host"])
-    storage_task([item["host"] for item in clusters.server])
-    common_task([item["host"] for item in clusters.server + clusters.client])
+    client_hosts = [item["host"] for item in clusters.client]
+    server_hosts = [item["host"] for item in clusters.server]
+    build_task(client_hosts[0])
+    storage_task(server_hosts)
+    common_task(server_hosts + client_hosts)

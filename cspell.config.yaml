@@ -35,6 +35,7 @@ words:
   - pkill
   - PODC
   - prehashed
+  - procs
   - proptest
   - quantiles
   - QUIC

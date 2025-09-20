@@ -125,7 +125,7 @@ pub struct StorageCore {
 
     version: StateVersion,
     active_state: HashMap<StorageKey, ActiveEntry>,
-    active_state_versions: BinaryHeap<Reverse<(StateVersion, StorageKey)>>,
+    active_versioned_keys: BinaryHeap<Reverse<(StateVersion, StorageKey)>>,
     fetch_tx_values: HashMap<StorageKey, oneshot::Sender<Option<Bytes>>>,
     bump_tx_ok: Option<oneshot::Sender<()>>,
     get_tasks: JoinSet<anyhow::Result<(StorageKey, ActiveEntry)>>,
@@ -163,7 +163,7 @@ impl StorageCore {
             tx_message,
             version: 0,
             active_state: Default::default(),
-            active_state_versions: Default::default(),
+            active_versioned_keys: Default::default(),
             fetch_tx_values: Default::default(),
             bump_tx_ok: None,
             get_tasks: JoinSet::new(),
@@ -301,10 +301,10 @@ impl StorageCore {
         }
 
         self.version += 1;
-        while let Some(&Reverse((version, _))) = self.active_state_versions.peek()
+        while let Some(&Reverse((version, _))) = self.active_versioned_keys.peek()
             && version + self.config.prefetch_offset < self.version
         {
-            let Reverse((_, key)) = self.active_state_versions.pop().unwrap();
+            let Reverse((_, key)) = self.active_versioned_keys.pop().unwrap();
             let Entry::Occupied(entry) = self.active_state.entry(key) else {
                 unreachable!()
             };
@@ -406,7 +406,7 @@ impl StorageCore {
             let _ = tx_value.send(entry.value.clone());
         }
 
-        self.active_state_versions
+        self.active_versioned_keys
             .push(Reverse((entry.version, key)));
         self.active_state.insert(key, entry);
     }

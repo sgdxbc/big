@@ -84,27 +84,27 @@ async fn role_bench(configs: Configs, index: u16) -> anyhow::Result<()> {
         let cancel = cancel.clone();
         async move {
             let _ = rx_start.await;
-            sleep(Duration::from_secs(10)).await;
+            sleep(Duration::from_secs(30)).await;
             cancel.cancel();
             anyhow::Ok(())
         }
     };
     let db;
-    // let mut options = Options::default();
-    let (mut options, cf_descs) = Options::load_latest(
-        temp_dir.path(),
-        rocksdb::Env::new()?,
-        false,
-        rocksdb::Cache::new_lru_cache(512 << 20),
-    )?;
+    let mut options = Options::default();
+    // let (mut options, cf_descs) = Options::load_latest(
+    //     temp_dir.path(),
+    //     rocksdb::Env::new()?,
+    //     false,
+    //     rocksdb::Cache::new_lru_cache(512 << 20),
+    // )?;
     options.enable_statistics();
     if configs.get("big.plain-storage")? {
-        // db = Arc::new(DB::open(&options, temp_dir.path())?);
-        db = Arc::new(DB::open_cf_descriptors(
-            &options,
-            temp_dir.path(),
-            cf_descs,
-        )?);
+        db = Arc::new(DB::open(&options, temp_dir.path())?);
+        // db = Arc::new(DB::open_cf_descriptors(
+        //     &options,
+        //     temp_dir.path(),
+        //     cf_descs,
+        // )?);
         let bench = BenchPlainStorage::new(true, configs.extract()?, db.clone(), cancel);
         let _ = tx_start.send(());
         try_join!(bench.run(), timeout)?;

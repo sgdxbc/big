@@ -3,10 +3,11 @@ from time import sleep
 
 
 def task(hosts):
-    wait_all([Ssh(host, "pkill -INT big") for host in hosts], fail_ok=True)
+    join([Ssh(host, "pkill -INT big") for host in hosts], allow_fail=True)
 
 
 if __name__ == "__main__":
     import clusters
 
-    task([item["host"] for item in clusters.server])
+    server_hosts = [item["host"] for item in clusters.server]
+    task(server_hosts)

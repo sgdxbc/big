@@ -6,10 +6,10 @@ def task(host, example=None):
         build_flag = "--bin big"
     else:
         build_flag = f"--example {example}"
-    local(f"cargo build -r {build_flag}")  # sanity check
-    ssh(host, f"mkdir -p {build_dir}")
-    local(f"rsync -aR --delete src/ examples/ Cargo.toml Cargo.lock {host}:{build_dir}/")
-    ssh(host, f"cd {build_dir} && /bin/bash -l -c 'cargo build -r {build_flag}'")
+    Local(f"cargo build -r {build_flag}").wait()  # sanity check
+    Ssh(host, f"mkdir -p {build_dir}").wait()
+    Local(f"rsync -aR --delete src/ examples/ Cargo.toml Cargo.lock {host}:{build_dir}/").wait()
+    Ssh(host, f"cd {build_dir} && /bin/bash -l -c 'cargo build -r {build_flag}'").wait()
 
 
 if __name__ == "__main__":

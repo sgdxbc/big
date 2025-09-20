@@ -7,4 +7,5 @@ requires-python = ">=3.13"
 dependencies = [
     "matplotlib>=3.10.6",
     "polars>=1.33.1",
+    "psutil>=7.1.0",
 ]
