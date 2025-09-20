@@ -135,7 +135,7 @@ impl Bench {
             let (tx_ok, rx_ok) = oneshot::channel();
             let _ = self.tx_op.send(StorageOp::Prefetch(key, tx_ok)).await;
             // rx_ok.await?;
-            let _ = rx_ok;
+            drop(rx_ok);
         }
         self.command_queue.push_back((command, key));
         Ok(())

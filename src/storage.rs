@@ -52,11 +52,14 @@ pub enum StorageOp {
     // receiving the next op will do. the result channel is currently for measuring latency in the
     // benchmark
     Bump(BumpUpdates, oneshot::Sender<()>),
-
-    Prefetch(StorageKey, oneshot::Sender<()>), // same reason as Bump
+    // similar to Bump; only start meansure latency after Prefetch is done
+    Prefetch(StorageKey, oneshot::Sender<()>),
 }
 
-pub type SegmentIndex = u32;
+// this indexes _data_ shards exclusively. every shard holds a fraction of the
+// `StorageKey`s. the _parity_ shards that no `StorageKey` maps to have no
+// ShardIndex
+pub type ShardIndex = u32;
 type StripeIndex = u32;
 
 #[derive(Clone)]
@@ -74,45 +77,37 @@ pub struct StorageConfig {
 }
 
 impl StorageConfig {
-    fn num_segment_per_stripe(&self) -> SegmentIndex {
+    fn num_shard_per_stripe(&self) -> ShardIndex {
         (self.num_faulty_node + 1) as _
     }
 
-    fn segment_of(&self, key: &StorageKey) -> SegmentIndex {
-        StdRng::from_seed(key.0).random_range(0..self.num_stripe * self.num_segment_per_stripe())
+    fn shard_of(&self, key: &StorageKey) -> ShardIndex {
+        StdRng::from_seed(key.0).random_range(0..self.num_stripe * self.num_shard_per_stripe())
     }
 
-    fn stripe_of(&self, segment_index: SegmentIndex) -> StripeIndex {
-        segment_index / self.num_segment_per_stripe()
+    // fn stripe_of(&self, shard_index: ShardIndex) -> StripeIndex {
+    //     shard_index / self.num_shard_per_stripe()
+    // }
+
+    fn primary_node_of(&self, shard_index: ShardIndex) -> NodeIndex {
+        (shard_index % self.num_node as ShardIndex) as _
     }
 
-    // node index       0   1   2   3       stripe index
-    // is primary of... 0   1               0
-    //                      2   3           1
-    //                          4   5       2
-    //                  7           6       3
-    //                  ...
-    fn primary_node_of(&self, segment_index: SegmentIndex) -> NodeIndex {
-        ((segment_index % self.num_segment_per_stripe() + self.stripe_of(segment_index))
-            % self.num_node as SegmentIndex) as _
+    fn nodes_of(&self, shard_index: ShardIndex) -> impl Iterator<Item = NodeIndex> {
+        let primary = self.primary_node_of(shard_index);
+        let backup = (0..self.num_node - 1)
+            .choose_multiple(
+                &mut StdRng::seed_from_u64(shard_index as _),
+                self.num_backup as _,
+            )
+            .into_iter()
+            .map(move |index| index + (index >= primary) as NodeIndex);
+        iter::once(primary).chain(backup)
     }
 
-    fn nodes_of(&self, segment_index: SegmentIndex) -> impl Iterator<Item = NodeIndex> {
-        let primary = self.primary_node_of(segment_index);
-        let backups = (0..self.num_node - 1).choose_multiple(
-            &mut StdRng::seed_from_u64(segment_index as _),
-            self.num_backup as _,
-        );
-        iter::once(primary).chain(
-            backups
-                .into_iter()
-                .map(move |index| index + (index >= primary) as NodeIndex),
-        )
-    }
-
-    pub fn segments_of(&self, node_indices: &[NodeIndex]) -> impl Iterator<Item = SegmentIndex> {
-        (0..self.num_stripe * self.num_segment_per_stripe()).filter(move |&segment_index| {
-            self.nodes_of(segment_index)
+    pub fn shards_of(&self, node_indices: &[NodeIndex]) -> impl Iterator<Item = ShardIndex> {
+        (0..self.num_stripe * self.num_shard_per_stripe()).filter(move |&shard_index| {
+            self.nodes_of(shard_index)
                 .any(|node_index| node_indices.contains(&node_index))
         })
     }
@@ -258,10 +253,10 @@ impl StorageCore {
         key: StorageKey,
         tx_ok: oneshot::Sender<()>,
     ) -> anyhow::Result<()> {
-        let segment_index = self.config.segment_of(&key);
+        let shard_index = self.config.shard_of(&key);
         if self
             .config
-            .nodes_of(segment_index)
+            .nodes_of(shard_index)
             .any(|node_index| self.node_indices.contains(&node_index))
         {
             // let db = self.db.clone();
@@ -281,7 +276,7 @@ impl StorageCore {
             //     Ok((key, entry))
             // });
             // let _ = rx_snapshot.await;
-            let Some(cf) = self.db.cf_handle(&format!("segment-{segment_index}")) else {
+            let Some(cf) = self.db.cf_handle(&format!("shard-{shard_index}")) else {
                 anyhow::bail!("missing column family")
             };
             let value = self.db.get_cf(cf, key.0)?;
@@ -320,13 +315,13 @@ impl StorageCore {
 
         let mut writes = Vec::new();
         for (key, value) in updates {
-            let segment_index = self.config.segment_of(&key);
+            let shard_index = self.config.shard_of(&key);
             if self
                 .config
-                .nodes_of(segment_index)
+                .nodes_of(shard_index)
                 .any(|node_index| self.node_indices.contains(&node_index))
             {
-                writes.push((segment_index, key, value.clone()))
+                writes.push((shard_index, key, value.clone()))
             }
 
             let entry = ActiveEntry {
@@ -358,8 +353,8 @@ impl StorageCore {
             // });
 
             let mut batch = WriteBatch::new();
-            for (segment_index, key, value) in writes {
-                let Some(cf) = self.db.cf_handle(&format!("segment-{segment_index}")) else {
+            for (shard_index, key, value) in writes {
+                let Some(cf) = self.db.cf_handle(&format!("shard-{shard_index}")) else {
                     anyhow::bail!("missing column family")
                 };
                 match value {
@@ -417,10 +412,10 @@ impl StorageCore {
     }
 
     fn may_push_entry(&self, key: StorageKey, value: Option<Bytes>) {
-        let segment = self.config.segment_of(&key);
+        let shard_index = self.config.shard_of(&key);
         if !self
             .node_indices
-            .contains(&self.config.primary_node_of(segment))
+            .contains(&self.config.primary_node_of(shard_index))
         {
             return;
         }
@@ -441,9 +436,9 @@ impl StorageCore {
         config: &StorageConfig,
         node_indices: Vec<NodeIndex>,
     ) -> anyhow::Result<()> {
-        let segment_indices = config.segments_of(&node_indices).collect::<HashSet<_>>();
-        for segment_index in &segment_indices {
-            db.create_cf(format!("segment-{segment_index}"), &Default::default())?
+        let shard_indices = config.shards_of(&node_indices).collect::<HashSet<_>>();
+        for shard_index in &shard_indices {
+            db.create_cf(format!("shard-{shard_index}"), &Default::default())?
         }
 
         let mut items = items.into_iter();
@@ -452,9 +447,9 @@ impl StorageCore {
             batch = WriteBatch::new();
             // wiki says "hundreds of keys"
             for (key, value) in items.by_ref() {
-                let segment_index = config.segment_of(&key);
-                if segment_indices.contains(&segment_index) {
-                    let Some(cf) = db.cf_handle(&format!("segment-{segment_index}")) else {
+                let shard_index = config.shard_of(&key);
+                if shard_indices.contains(&shard_index) {
+                    let Some(cf) = db.cf_handle(&format!("shard-{shard_index}")) else {
                         unimplemented!()
                     };
                     batch.put_cf(cf, key.0, &value);

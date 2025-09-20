@@ -90,10 +90,21 @@ async fn role_bench(configs: Configs, index: u16) -> anyhow::Result<()> {
         }
     };
     let db;
-    let mut options = Options::default();
+    // let mut options = Options::default();
+    let (mut options, cf_descs) = Options::load_latest(
+        temp_dir.path(),
+        rocksdb::Env::new()?,
+        false,
+        rocksdb::Cache::new_lru_cache(512 << 20),
+    )?;
     options.enable_statistics();
     if configs.get("big.plain-storage")? {
-        db = Arc::new(DB::open(&options, temp_dir.path())?);
+        // db = Arc::new(DB::open(&options, temp_dir.path())?);
+        db = Arc::new(DB::open_cf_descriptors(
+            &options,
+            temp_dir.path(),
+            cf_descs,
+        )?);
         let bench = BenchPlainStorage::new(true, configs.extract()?, db.clone(), cancel);
         let _ = tx_start.send(());
         try_join!(bench.run(), timeout)?;
@@ -101,7 +112,7 @@ async fn role_bench(configs: Configs, index: u16) -> anyhow::Result<()> {
         let storage_config = configs.extract::<StorageConfig>()?;
         let node_indices = vec![index];
         let cfs = storage_config
-            .segments_of(&node_indices)
+            .shards_of(&node_indices)
             .map(|i| format!("segment-{i}"));
         db = Arc::new(open_db(temp_dir.path(), cfs)?);
 
@@ -125,6 +136,9 @@ async fn role_bench(configs: Configs, index: u16) -> anyhow::Result<()> {
     }
     if let Some(stats) = db.property_value("rocksdb.options-statistics")? {
         info!("rocksdb.options-statistics\n{stats}")
+    }
+    if let Some(stats) = db.property_value("rocksdb.sstables")? {
+        info!("rocksdb.sstables\n{stats}")
     }
 
     Ok(())
