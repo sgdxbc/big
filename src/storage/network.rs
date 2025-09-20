@@ -98,7 +98,7 @@ impl Outgoing {
 pub struct Storage {
     tx_mesh_established: oneshot::Sender<()>,
 
-    core: super::StorageCore,
+    core: super::Storage,
     incoming: Incoming,
     outgoing: Outgoing,
     network: Network,
@@ -123,7 +123,7 @@ impl Storage {
         let (tx_incoming_bytes, rx_incoming_bytes) = channel(100);
         let (tx_outgoing_bytes, rx_outgoing_bytes) = channel(100);
 
-        let core = super::StorageCore::new(
+        let core = super::Storage::new(
             config,
             node_indices.clone(),
             db,

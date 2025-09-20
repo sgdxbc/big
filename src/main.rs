@@ -4,7 +4,7 @@ use big::{
     logging::init_logging_file,
     parse::Configs,
     storage::{
-        StorageConfig, StorageCore,
+        StorageConfig, Storage,
         bench::{Bench, BenchPlainStorage, BenchStorage},
         plain::PlainStorage,
     },
@@ -56,7 +56,7 @@ async fn role_prefill(configs: Configs, index: u16) -> anyhow::Result<()> {
     if configs.get("big.plain-storage")? {
         PlainStorage::prefill(db, items).await
     } else {
-        StorageCore::prefill(&mut db, items, &configs.extract()?, [index].into())
+        Storage::prefill(&mut db, items, &configs.extract()?, [index].into())
     }
 }
 

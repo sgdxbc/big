@@ -4,7 +4,7 @@ use big::{
     logging::init_logging,
     parse::Configs,
     storage::{
-        StorageCore,
+        Storage,
         bench::{Bench, BenchStorage},
     },
 };
@@ -43,7 +43,7 @@ addrs   127.0.0.1:5003
         let db_path = temp_dir.path().join(format!("node-{node_index}"));
         fs::create_dir(&db_path).await?;
         let mut db = DB::open_default(&db_path)?;
-        StorageCore::prefill(
+        Storage::prefill(
             &mut db,
             Bench::prefill_items(configs.extract()?),
             &configs.extract()?,

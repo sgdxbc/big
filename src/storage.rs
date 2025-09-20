@@ -52,7 +52,7 @@ pub enum StorageOp {
     // receiving the next op will do. the result channel is currently for measuring latency in the
     // benchmark
     Bump(BumpUpdates, oneshot::Sender<()>),
-    // similar to Bump; only start meansure latency after Prefetch is done
+    // similar to Bump; only start measure latency after Prefetch is done
     Prefetch(StorageKey, oneshot::Sender<()>),
 }
 
@@ -113,7 +113,7 @@ impl StorageConfig {
     }
 }
 
-pub struct StorageCore {
+pub struct Storage {
     config: StorageConfig,
     node_indices: Vec<NodeIndex>,
     db: Arc<DB>,
@@ -143,7 +143,7 @@ pub enum SendTo {
     // individual?
 }
 
-impl StorageCore {
+impl Storage {
     fn new(
         config: StorageConfig,
         node_indices: Vec<NodeIndex>,
