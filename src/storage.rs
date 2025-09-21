@@ -118,7 +118,7 @@ impl StorageConfig {
         iter::once(primary).chain(backup)
     }
 
-    pub fn shards_of(&self, node_indices: &[NodeIndex]) -> impl Iterator<Item = ShardIndex> {
+    fn shards_of(&self, node_indices: &[NodeIndex]) -> impl Iterator<Item = ShardIndex> {
         (0..self.num_stripe * self.num_shard_per_stripe()).filter(move |&shard_index| {
             self.nodes_of(shard_index)
                 .any(|node_index| node_indices.contains(&node_index))
@@ -559,7 +559,7 @@ impl Storage {
         while {
             batch = WriteBatch::new();
             // wiki says "hundreds of keys"
-            for (key, value) in items.by_ref() {
+            for (key, value) in &mut items {
                 let shard_index = config.shard_of(&key);
                 if shard_indices.contains(&shard_index) {
                     batch.put([&shard_index.to_le_bytes()[..], &key.0].concat(), &value);

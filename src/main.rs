@@ -4,7 +4,7 @@ use big::{
     logging::init_logging_file,
     parse::Configs,
     storage::{
-        Storage, StorageConfig,
+        Storage,
         bench::{Bench, BenchPlainStorage, BenchStorage},
         plain::PlainStorage,
     },
@@ -50,6 +50,7 @@ async fn role_prefill(configs: Configs, index: u16) -> anyhow::Result<()> {
     let mut options = Options::default();
     options.prepare_for_bulk_load();
     options.create_if_missing(true);
+    options.increase_parallelism(std::thread::available_parallelism()?.get() as _);
     options.set_max_subcompactions(std::thread::available_parallelism()?.get() as _);
     let db = DB::open(&options, path)?;
     let items = Bench::prefill_items(configs.extract()?);
@@ -84,12 +85,11 @@ async fn role_bench(configs: Configs, index: u16) -> anyhow::Result<()> {
         let cancel = cancel.clone();
         async move {
             let _ = rx_start.await;
-            sleep(Duration::from_secs(30)).await;
+            sleep(Duration::from_secs(10)).await;
             cancel.cancel();
             anyhow::Ok(())
         }
     };
-    let db;
     let mut options = Options::default();
     // let (mut options, cf_descs) = Options::load_latest(
     //     temp_dir.path(),
@@ -98,8 +98,9 @@ async fn role_bench(configs: Configs, index: u16) -> anyhow::Result<()> {
     //     rocksdb::Cache::new_lru_cache(512 << 20),
     // )?;
     options.enable_statistics();
+    options.increase_parallelism(std::thread::available_parallelism()?.get() as _);
+    let db = Arc::new(DB::open(&options, temp_dir.path())?);
     if configs.get("big.plain-storage")? {
-        db = Arc::new(DB::open(&options, temp_dir.path())?);
         // db = Arc::new(DB::open_cf_descriptors(
         //     &options,
         //     temp_dir.path(),
@@ -109,21 +110,14 @@ async fn role_bench(configs: Configs, index: u16) -> anyhow::Result<()> {
         let _ = tx_start.send(());
         try_join!(bench.run(), timeout)?;
     } else {
-        let storage_config = configs.extract::<StorageConfig>()?;
-        let node_indices = vec![index];
-        let cfs = storage_config
-            .shards_of(&node_indices)
-            .map(|i| format!("segment-{i}"));
-        db = Arc::new(open_db(temp_dir.path(), cfs)?);
-
         let mut addrs = configs.get_values("addrs")?;
         addrs.truncate(configs.get("big.num-node")?);
         let bench = BenchStorage::new(
             index as _,
             addrs,
             configs.extract()?,
-            storage_config,
-            node_indices,
+            configs.extract()?,
+            vec![index],
             db.clone(),
             (0..configs.get("big.num-node")?).collect(),
             cancel,
@@ -142,12 +136,4 @@ async fn role_bench(configs: Configs, index: u16) -> anyhow::Result<()> {
     // }
 
     Ok(())
-}
-
-fn open_db(path: impl AsRef<Path>, cfs: impl IntoIterator<Item = String>) -> anyhow::Result<DB> {
-    let db = DB::open_cf(&Default::default(), path, cfs)?;
-    db.put("", "")?;
-    db.get("")?;
-    info!("db ready");
-    Ok(db)
 }
