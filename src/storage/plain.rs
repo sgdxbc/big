@@ -77,6 +77,8 @@ impl PlainSyncStorage {
     }
 }
 
+// this is pretty close to DBWorker + ActiveStateWorker + Storage::handle_op without sharding
+// maybe should be unified, but feels hard and overkill
 pub struct PlainPrefetchStorage {
     db: Arc<DB>,
     prefetch_offset: StateVersion,
@@ -86,7 +88,7 @@ pub struct PlainPrefetchStorage {
 
     version: StateVersion,
     active_entries: HashMap<StorageKey, ActiveEntry>,
-    active_versioned_keys: BinaryHeap<Reverse<(StateVersion, StorageKey)>>,
+    active_entry_key_queue: BinaryHeap<Reverse<(StateVersion, StorageKey)>>,
     fetch_tx_values: HashMap<StorageKey, oneshot::Sender<Option<Bytes>>>,
     tasks: JoinSet<anyhow::Result<(StorageKey, ActiveEntry)>>,
 }
@@ -110,7 +112,7 @@ impl PlainPrefetchStorage {
             rx_op,
             version: 0,
             active_entries: Default::default(),
-            active_versioned_keys: Default::default(),
+            active_entry_key_queue: Default::default(),
             fetch_tx_values: Default::default(),
             tasks: JoinSet::new(),
         }
@@ -149,10 +151,10 @@ impl PlainPrefetchStorage {
                     }
                     StorageOp::Bump(items, tx_ok) => {
                         self.version += 1;
-                        while let Some(&Reverse((version, _))) = self.active_versioned_keys.peek()
+                        while let Some(&Reverse((version, _))) = self.active_entry_key_queue.peek()
                             && version + self.prefetch_offset < self.version
                         {
-                            let Reverse((_, key)) = self.active_versioned_keys.pop().unwrap();
+                            let Reverse((_, key)) = self.active_entry_key_queue.pop().unwrap();
                             let Entry::Occupied(entry) = self.active_entries.entry(key) else {
                                 unreachable!()
                             };
@@ -168,7 +170,7 @@ impl PlainPrefetchStorage {
                                 value: value.clone(),
                             };
                             self.active_entries.insert(key, entry);
-                            self.active_versioned_keys
+                            self.active_entry_key_queue
                                 .push(Reverse((self.version, key)));
                             match value {
                                 Some(value) => batch.put(key.0, &value),
@@ -209,7 +211,7 @@ impl PlainPrefetchStorage {
                     if let Some(tx_value) = self.fetch_tx_values.remove(&storage_key) {
                         let _ = tx_value.send(active_entry.value.clone());
                     }
-                    self.active_versioned_keys
+                    self.active_entry_key_queue
                         .push(Reverse((active_entry.version, storage_key)));
                     entry.insert_entry(active_entry);
                 }

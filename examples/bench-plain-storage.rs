@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{env::args, time::Duration};
 
 use big::{
     logging::init_logging,
@@ -22,7 +22,7 @@ async fn main() -> anyhow::Result<()> {
         "
 bench.num-key       1000000
 bench.put-ratio     0.5
-bench.prefetch-offset 0
+bench.prefetch-offset 10
 ",
     );
 
@@ -34,7 +34,12 @@ bench.prefetch-offset 0
     let db = DB::open_default(temp_dir.path())?;
 
     let cancel = CancellationToken::new();
-    let bench = BenchPlainStorage::new(false, configs.extract()?, db.into(), cancel.clone());
+    let bench = BenchPlainStorage::new(
+        args().nth(1).as_deref() == Some("prefetch"),
+        configs.extract()?,
+        db.into(),
+        cancel.clone(),
+    );
     let timeout = async {
         sleep(Duration::from_secs(10)).await;
         cancel.cancel();

@@ -17,9 +17,10 @@ use tokio::{
         oneshot,
     },
     task::JoinSet,
+    try_join,
 };
 use tokio_util::{future::FutureExt, sync::CancellationToken};
-use tracing::{info, trace};
+use tracing::trace;
 
 use self::message::Message;
 
@@ -40,7 +41,7 @@ impl StorageKey {
 
 impl Debug for StorageKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "StorageKey(0x{})", self.to_hex())
+        write!(f, "StorageKey(0x{}...)", &self.to_hex()[..8])
     }
 }
 
@@ -56,6 +57,16 @@ pub enum StorageOp {
     Bump(BumpUpdates, oneshot::Sender<()>),
     // similar to Bump; only start measure latency after Prefetch is done
     Prefetch(StorageKey, oneshot::Sender<()>),
+}
+
+impl Debug for StorageOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StorageOp::Fetch(key, _) => write!(f, "Fetch({key:?})"),
+            StorageOp::Bump(updates, _) => write!(f, "Bump(len={})", updates.len()),
+            StorageOp::Prefetch(key, _) => write!(f, "Prefetch({key:?})"),
+        }
+    }
 }
 
 // this indexes _data_ shards exclusively. every shard holds a fraction of the
@@ -115,17 +126,17 @@ impl StorageConfig {
     }
 }
 
-struct ShardWorker {
-    index: ShardIndex,
+struct DbWorker {
+    config: StorageConfig,
     db: Arc<DB>,
 
     cancel: CancellationToken,
     // later extend the results of these two with proof and update info
-    rx_op: Receiver<ShardWorkerOp>,
+    rx_op: Receiver<DbWorkerOp>,
     tasks: JoinSet<anyhow::Result<()>>,
 }
 
-enum ShardWorkerOp {
+enum DbWorkerOp {
     Get(Get, oneshot::Sender<GetRes>),
     Put(Put, oneshot::Sender<PutRes>),
 }
@@ -146,15 +157,15 @@ struct Put {
 
 struct PutRes; // update info
 
-impl ShardWorker {
+impl DbWorker {
     fn new(
-        index: ShardIndex,
+        config: StorageConfig,
         db: Arc<DB>,
         cancel: CancellationToken,
-        rx_op: Receiver<ShardWorkerOp>,
+        rx_op: Receiver<DbWorkerOp>,
     ) -> Self {
         Self {
-            index,
+            config,
             db,
             cancel,
             rx_op,
@@ -171,17 +182,10 @@ impl ShardWorker {
     }
 
     async fn run_inner(&mut self) -> anyhow::Result<()> {
-        info!(
-            "shard worker {}/{} started",
-            self.index,
-            self.db.path().display()
-        );
-        let prefix = self.index.to_le_bytes();
-        let db_version_key = move || [&prefix[..], b".version"].concat();
-        self.db.put(db_version_key(), b"0")?;
+        self.db.put(".version", 0.to_string())?;
         loop {
             enum Event<R> {
-                Op(ShardWorkerOp),
+                Op(DbWorkerOp),
                 TaskResult(R),
             }
             match select! {
@@ -189,14 +193,16 @@ impl ShardWorker {
                 Some(result) = self.tasks.join_next() => Event::TaskResult(result),
                 else => break,
             } {
-                Event::Op(ShardWorkerOp::Get(Get(key), tx_res)) => {
+                Event::Op(DbWorkerOp::Get(Get(key), tx_res)) => {
+                    let shard_index = self.config.shard_of(&key);
                     let db = self.db.clone();
                     self.tasks.spawn(async move {
                         let snapshot = db.snapshot();
-                        let Some(version) = snapshot.get_pinned(db_version_key())? else {
+                        let Some(version) = snapshot.get_pinned(".version")? else {
                             anyhow::bail!("missing version")
                         };
-                        let value = snapshot.get([&prefix[..], &key.0].concat())?;
+                        let value =
+                            snapshot.get([&shard_index.to_le_bytes()[..], &key.0].concat())?;
                         let res = GetRes {
                             version: str::from_utf8(&version)?.parse()?,
                             value: value.map(Into::into),
@@ -205,11 +211,12 @@ impl ShardWorker {
                         Ok(())
                     });
                 }
-                Event::Op(ShardWorkerOp::Put(put, tx_res)) => {
+                Event::Op(DbWorkerOp::Put(put, tx_res)) => {
                     let mut batch = WriteBatch::new();
-                    batch.put(db_version_key(), put.version.to_string());
+                    batch.put(".version", put.version.to_string());
                     for (key, value) in put.updates {
-                        let db_key = [&prefix[..], &key.0].concat();
+                        let shard_index = self.config.shard_of(&key);
+                        let db_key = [&shard_index.to_le_bytes()[..], &key.0].concat();
                         match value {
                             Some(v) => batch.put(&db_key, &v),
                             None => batch.delete(&db_key),
@@ -234,7 +241,7 @@ struct ActiveStateWorker {
     purge_version: StateVersion,
     entries: HashMap<StorageKey, ActiveEntry>,
     entry_key_queue: BinaryHeap<Reverse<(StateVersion, StorageKey)>>,
-    tx_fetch_values: HashMap<StorageKey, oneshot::Sender<Option<Bytes>>>,
+    fetch_tx_values: HashMap<StorageKey, oneshot::Sender<Option<Bytes>>>,
 }
 
 enum ActiveStateOp {
@@ -251,7 +258,7 @@ impl ActiveStateWorker {
             purge_version: 0,
             entries: Default::default(),
             entry_key_queue: Default::default(),
-            tx_fetch_values: Default::default(),
+            fetch_tx_values: Default::default(),
         }
     }
 
@@ -271,7 +278,7 @@ impl ActiveStateWorker {
                         assert!(entry.version >= self.purge_version);
                         let _ = tx_value.send(entry.value.clone());
                     } else {
-                        let replaced = self.tx_fetch_values.insert(key, tx_value);
+                        let replaced = self.fetch_tx_values.insert(key, tx_value);
                         anyhow::ensure!(replaced.is_none(), "concurrent fetch for the same key");
                     }
                 }
@@ -289,7 +296,7 @@ impl ActiveStateWorker {
                         continue;
                     }
 
-                    if let Some(tx_value) = self.tx_fetch_values.remove(&key) {
+                    if let Some(tx_value) = self.fetch_tx_values.remove(&key) {
                         let _ = tx_value.send(entry.value.clone());
                     }
                     self.entry_key_queue.push(Reverse((entry.version, key)));
@@ -318,6 +325,7 @@ impl ActiveStateWorker {
 pub struct Storage {
     config: StorageConfig,
     node_indices: Vec<NodeIndex>,
+    shard_indices: HashSet<ShardIndex>,
 
     cancel: CancellationToken,
     rx_op: Receiver<StorageOp>,
@@ -328,12 +336,12 @@ pub struct Storage {
 
     workers: Option<StorageWorkers>,
     tx_active_state_op: Sender<ActiveStateOp>,
-    tx_shard_worker_ops: HashMap<ShardIndex, Sender<ShardWorkerOp>>,
+    tx_db_worker_op: Sender<DbWorkerOp>,
 }
 
 struct StorageWorkers {
     active_state_worker: ActiveStateWorker,
-    shard_workers: Vec<ShardWorker>,
+    db_worker: DbWorker,
 }
 
 #[derive(Clone)]
@@ -360,16 +368,11 @@ impl Storage {
         let (tx_active_state_op, rx_active_state_op) = channel(100);
         let active_state_worker = ActiveStateWorker::new(cancel.clone(), rx_active_state_op);
 
-        let mut shard_workers = Vec::new();
-        let mut tx_shard_worker_ops = HashMap::new();
-        for shard_index in config.shards_of(&node_indices) {
-            let (tx_op, rx_op) = channel(100);
-            let node = ShardWorker::new(shard_index, db.clone(), cancel.clone(), rx_op);
-            shard_workers.push(node);
-            tx_shard_worker_ops.insert(shard_index, tx_op);
-        }
+        let (tx_db_worker_op, rx_db_worker_op) = channel(100);
+        let db_worker = DbWorker::new(config.clone(), db, cancel.clone(), rx_db_worker_op);
 
         Self {
+            shard_indices: config.shards_of(&node_indices).collect(),
             config,
             node_indices,
             cancel,
@@ -379,30 +382,27 @@ impl Storage {
             version: 0,
             workers: Some(StorageWorkers {
                 active_state_worker,
-                shard_workers,
+                db_worker,
             }),
             tx_active_state_op,
-            tx_shard_worker_ops,
+            tx_db_worker_op,
         }
     }
 
     async fn run(mut self) -> anyhow::Result<()> {
         let workers = self.workers.take().unwrap();
-        let mut tasks = JoinSet::new();
-        tasks.spawn(workers.active_state_worker.run());
-        for worker in workers.shard_workers {
-            tasks.spawn(worker.run());
-        }
-        tasks.spawn(async move {
+        let task = async move {
             self.cancel
                 .clone()
                 .run_until_cancelled(self.run_inner())
                 .await
                 .unwrap_or(Ok(()))
-        });
-        while let Some(result) = tasks.join_next().await {
-            result??
-        }
+        };
+        try_join!(
+            task,
+            workers.active_state_worker.run(),
+            workers.db_worker.run(),
+        )?;
         Ok(())
     }
 
@@ -425,6 +425,7 @@ impl Storage {
     }
 
     async fn handle_op(&mut self, op: StorageOp) {
+        trace!("{:?} version={} {op:?}", self.node_indices, self.version);
         match op {
             StorageOp::Fetch(storage_key, tx_value) => {
                 let _ = self
@@ -432,62 +433,61 @@ impl Storage {
                     .send(ActiveStateOp::Fetch(storage_key, tx_value))
                     .await;
             }
-            StorageOp::Bump(updates, tx_ok) => {
+            StorageOp::Bump(mut updates, tx_ok) => {
                 self.version += 1;
-                let _ = self
-                    .tx_active_state_op
-                    .send(ActiveStateOp::Purge(
-                        self.version - self.config.prefetch_offset,
-                    ))
-                    .await;
-                let mut shard_updates = HashMap::new();
-                for (storage_key, value) in updates {
+                if self.version >= self.config.prefetch_offset {
+                    let _ = self
+                        .tx_active_state_op
+                        .send(ActiveStateOp::Purge(
+                            self.version - self.config.prefetch_offset,
+                        ))
+                        .await;
+                }
+                for (storage_key, value) in &updates {
                     let active_entry = ActiveEntry {
                         version: self.version,
                         value: value.clone(),
                     };
                     let _ = self
                         .tx_active_state_op
-                        .send(ActiveStateOp::Install(storage_key, active_entry))
+                        .send(ActiveStateOp::Install(storage_key.clone(), active_entry))
                         .await;
-                    shard_updates
-                        .entry(self.config.shard_of(&storage_key))
-                        .or_insert_with(Vec::new)
-                        .push((storage_key, value))
                 }
 
-                for (&shard_index, tx_shard_worker_op) in &self.tx_shard_worker_ops {
-                    let updates = shard_updates.remove(&shard_index).unwrap_or_default();
-                    let put = Put {
-                        version: self.version,
-                        updates,
-                    };
-                    let (tx_res, rx_res) = oneshot::channel();
-                    let _ = tx_shard_worker_op
-                        .send(ShardWorkerOp::Put(put, tx_res))
-                        .await;
-                    // the underlying worker guarantees to not start Get before finishing
-                    // earlier `Put`s, so its safe to handle Prefetch (and issue Get) before
-                    // Put is done i.e. rx_res is resolved
-                    spawn(
-                        async move {
-                            let Ok(PutRes) = rx_res.await else {
-                                return;
-                            };
-                            // TODO broadcast update info
-                        }
-                        .with_cancellation_token_owned(self.cancel.clone()),
-                    );
-                }
+                updates.retain(|(key, _)| self.shard_indices.contains(&self.config.shard_of(key)));
+                let put = Put {
+                    version: self.version,
+                    updates,
+                };
+                let (tx_res, rx_res) = oneshot::channel();
+                let _ = self
+                    .tx_db_worker_op
+                    .send(DbWorkerOp::Put(put, tx_res))
+                    .await;
+                // the underlying worker guarantees to not start Get before finishing
+                // earlier `Put`s, so its safe to handle Prefetch (and issue Get) before
+                // Put is done i.e. rx_res is resolved
+                spawn(
+                    async move {
+                        let Ok(PutRes) = rx_res.await else {
+                            return;
+                        };
+                        // TODO broadcast update info
+                    }
+                    .with_cancellation_token_owned(self.cancel.clone()),
+                );
                 let _ = tx_ok.send(());
             }
             StorageOp::Prefetch(storage_key, tx_ok) => {
                 let shard_index = self.config.shard_of(&storage_key);
-                if let Some(tx_shard_worker_op) = self.tx_shard_worker_ops.get(&shard_index) {
-                    trace!("prefetching entry for key {:?}", storage_key);
+                if self
+                    .shard_indices
+                    .contains(&self.config.shard_of(&storage_key))
+                {
                     let (tx_res, rx_res) = oneshot::channel();
-                    let _ = tx_shard_worker_op
-                        .send(ShardWorkerOp::Get(Get(storage_key), tx_res))
+                    let _ = self
+                        .tx_db_worker_op
+                        .send(DbWorkerOp::Get(Get(storage_key), tx_res))
                         .await;
                     let tx_active_state_op = self.tx_active_state_op.clone();
                     let tx_message = if self
