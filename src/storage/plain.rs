@@ -55,7 +55,7 @@ impl PlainSyncStorage {
             match op {
                 StorageOp::Fetch(key, tx_value) => {
                     let value = self.db.get(key.0)?;
-                    let _ = tx_value.send(value.map(Bytes::from));
+                    let _ = tx_value.send(value.map(Into::into));
                 }
                 StorageOp::Bump(updates, tx_ok) => {
                     let mut batch = WriteBatch::new();
@@ -191,7 +191,7 @@ impl PlainPrefetchStorage {
                             let value = snapshot.get(storage_key.0)?;
                             let active_entry = ActiveEntry {
                                 version,
-                                value: value.map(Bytes::from),
+                                value: value.map(Into::into),
                             };
                             Ok((storage_key, active_entry))
                         });

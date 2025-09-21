@@ -137,9 +137,9 @@ async fn role_bench(configs: Configs, index: u16) -> anyhow::Result<()> {
     if let Some(stats) = db.property_value("rocksdb.options-statistics")? {
         info!("rocksdb.options-statistics\n{stats}")
     }
-    if let Some(stats) = db.property_value("rocksdb.sstables")? {
-        info!("rocksdb.sstables\n{stats}")
-    }
+    // if let Some(stats) = db.property_value("rocksdb.sstables")? {
+    //     info!("rocksdb.sstables\n{stats}")
+    // }
 
     Ok(())
 }

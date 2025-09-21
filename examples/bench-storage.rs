@@ -22,12 +22,12 @@ async fn main() -> anyhow::Result<()> {
         "
 bench.num-key           1000000
 bench.put-ratio         0.5
-bench.prefetch-offset   10
+bench.prefetch-offset   0
 
 big.num-node            4
 big.num-faulty-node     1
 big.num-stripe          10
-big.num-backup          1
+big.num-backup          0
 
 addrs   127.0.0.1:5000
 addrs   127.0.0.1:5001

@@ -1,6 +1,7 @@
 use std::{
     cmp::Reverse,
     collections::{BinaryHeap, HashMap, HashSet, hash_map::Entry},
+    fmt::Debug,
     iter,
     sync::Arc,
 };
@@ -18,6 +19,7 @@ use tokio::{
     task::JoinSet,
 };
 use tokio_util::{future::FutureExt, sync::CancellationToken};
+use tracing::{info, trace};
 
 use self::message::Message;
 
@@ -29,6 +31,18 @@ pub type NodeIndex = u16;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Encode, Decode)]
 pub struct StorageKey([u8; 32]);
+
+impl StorageKey {
+    fn to_hex(&self) -> String {
+        self.0.iter().map(|b| format!("{b:02x}")).collect()
+    }
+}
+
+impl Debug for StorageKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "StorageKey(0x{})", self.to_hex())
+    }
+}
 
 pub type StateVersion = u64;
 
@@ -157,6 +171,11 @@ impl ShardWorker {
     }
 
     async fn run_inner(&mut self) -> anyhow::Result<()> {
+        info!(
+            "shard worker {}/{} started",
+            self.index,
+            self.db.path().display()
+        );
         let prefix = self.index.to_le_bytes();
         let db_version_key = move || [&prefix[..], b".version"].concat();
         self.db.put(db_version_key(), b"0")?;
@@ -180,7 +199,7 @@ impl ShardWorker {
                         let value = snapshot.get([&prefix[..], &key.0].concat())?;
                         let res = GetRes {
                             version: str::from_utf8(&version)?.parse()?,
-                            value: value.map(Bytes::from),
+                            value: value.map(Into::into),
                         };
                         let _ = tx_res.send(res);
                         Ok(())
@@ -257,6 +276,10 @@ impl ActiveStateWorker {
                     }
                 }
                 ActiveStateOp::Install(key, entry) => {
+                    trace!(
+                        "installing entry for key {:?} at version {}",
+                        key, entry.version
+                    );
                     if entry.version < self.purge_version {
                         continue;
                     }
@@ -433,11 +456,8 @@ impl Storage {
                         .push((storage_key, value))
                 }
 
-                for (shard_index, updates) in shard_updates {
-                    let Some(tx_shard_worker_op) = self.tx_shard_worker_ops.get(&shard_index)
-                    else {
-                        continue;
-                    };
+                for (&shard_index, tx_shard_worker_op) in &self.tx_shard_worker_ops {
+                    let updates = shard_updates.remove(&shard_index).unwrap_or_default();
                     let put = Put {
                         version: self.version,
                         updates,
@@ -464,6 +484,7 @@ impl Storage {
             StorageOp::Prefetch(storage_key, tx_ok) => {
                 let shard_index = self.config.shard_of(&storage_key);
                 if let Some(tx_shard_worker_op) = self.tx_shard_worker_ops.get(&shard_index) {
+                    trace!("prefetching entry for key {:?}", storage_key);
                     let (tx_res, rx_res) = oneshot::channel();
                     let _ = tx_shard_worker_op
                         .send(ShardWorkerOp::Get(Get(storage_key), tx_res))
@@ -511,9 +532,10 @@ impl Storage {
     async fn handle_message(&mut self, message: Message) {
         match message {
             Message::PushEntry(push_entry) => {
+                // TODO verify
                 let entry = ActiveEntry {
                     version: push_entry.version,
-                    value: push_entry.value.map(Bytes::from),
+                    value: push_entry.value.map(Into::into),
                 };
                 let _ = self
                     .tx_active_state_op

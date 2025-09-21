@@ -156,7 +156,7 @@ impl Bench {
             let key = Self::uniform_key(i);
             let mut value = vec![0; 68];
             rng.fill(&mut value[..]);
-            (key, Bytes::from(value))
+            (key, value.into())
         })
     }
 }
