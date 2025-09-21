@@ -7,19 +7,17 @@ use std::{
 
 use bincode::{Decode, Encode};
 use bytes::Bytes;
-use primitive_types::H256;
 use rand::{Rng, SeedableRng, rngs::StdRng, seq::IteratorRandom};
 use rocksdb::{DB, WriteBatch};
 use tokio::{
-    select,
+    select, spawn,
     sync::{
-        mpsc::{Receiver, Sender},
+        mpsc::{Receiver, Sender, channel},
         oneshot,
     },
     task::JoinSet,
 };
-use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tokio_util::{future::FutureExt, sync::CancellationToken};
 
 use self::message::Message;
 
@@ -33,16 +31,6 @@ pub type NodeIndex = u16;
 pub struct StorageKey([u8; 32]);
 
 pub type StateVersion = u64;
-
-impl StorageKey {
-    pub fn from_hex(s: &str) -> anyhow::Result<Self> {
-        Ok(Self(s.parse::<H256>()?.into()))
-    }
-
-    pub fn to_hex(&self) -> String {
-        format!("{:x}", H256::from(self.0))
-    }
-}
 
 type BumpUpdates = Vec<(StorageKey, Option<Bytes>)>;
 
@@ -113,10 +101,200 @@ impl StorageConfig {
     }
 }
 
+struct ShardWorker {
+    index: ShardIndex,
+    db: Arc<DB>,
+
+    cancel: CancellationToken,
+    // later extend the results of these two with proof and update info
+    rx_op: Receiver<ShardWorkerOp>,
+    tasks: JoinSet<anyhow::Result<()>>,
+}
+
+enum ShardWorkerOp {
+    Get(Get, oneshot::Sender<GetRes>),
+    Put(Put, oneshot::Sender<PutRes>),
+}
+
+// really unnecessary wrapper, just to keep the pattern consistent
+struct Get(StorageKey);
+
+struct GetRes {
+    version: StateVersion,
+    value: Option<Bytes>,
+    // proof
+}
+
+struct Put {
+    version: StateVersion,
+    updates: Vec<(StorageKey, Option<Bytes>)>,
+}
+
+struct PutRes; // update info
+
+impl ShardWorker {
+    fn new(
+        index: ShardIndex,
+        db: Arc<DB>,
+        cancel: CancellationToken,
+        rx_op: Receiver<ShardWorkerOp>,
+    ) -> Self {
+        Self {
+            index,
+            db,
+            cancel,
+            rx_op,
+            tasks: JoinSet::new(),
+        }
+    }
+
+    pub async fn run(mut self) -> anyhow::Result<()> {
+        self.cancel
+            .clone()
+            .run_until_cancelled(self.run_inner())
+            .await
+            .unwrap_or(Ok(()))
+    }
+
+    async fn run_inner(&mut self) -> anyhow::Result<()> {
+        loop {
+            enum Event<R> {
+                Op(ShardWorkerOp),
+                TaskResult(R),
+            }
+            match select! {
+                Some(op) = self.rx_op.recv() => Event::Op(op),
+                Some(result) = self.tasks.join_next() => Event::TaskResult(result),
+                else => break,
+            } {
+                Event::Op(ShardWorkerOp::Get(Get(storage_key), tx_res)) => {
+                    let mut key = self.index.to_le_bytes().to_vec();
+                    key.extend_from_slice(&storage_key.0);
+                    let db = self.db.clone();
+                    self.tasks.spawn(async move {
+                        let snapshot = db.snapshot();
+                        let Some(version) = snapshot.get_pinned(b".version")? else {
+                            anyhow::bail!("missing version")
+                        };
+                        let value = snapshot.get(&key)?;
+                        let res = GetRes {
+                            version: str::from_utf8(&version)?.parse()?,
+                            value: value.map(Bytes::from),
+                        };
+                        let _ = tx_res.send(res);
+                        Ok(())
+                    });
+                }
+                Event::Op(ShardWorkerOp::Put(put, tx_res)) => {
+                    let mut batch = WriteBatch::new();
+                    batch.put(b".version", put.version.to_string());
+                    for (storage_key, value) in put.updates {
+                        let mut key = self.index.to_le_bytes().to_vec();
+                        key.extend_from_slice(&storage_key.0);
+                        match value {
+                            Some(v) => batch.put(&key, &v),
+                            None => batch.delete(&key),
+                        }
+                    }
+                    // perform write inline in the event loop, blocking the later `Get`s
+                    // so that any Get received after this Put will see the updated version
+                    self.db.write(batch)?;
+                    let _ = tx_res.send(PutRes);
+                }
+                Event::TaskResult(result) => result??,
+            }
+        }
+        Ok(())
+    }
+}
+
+struct ActiveStateWorker {
+    cancel: CancellationToken,
+    rx_op: Receiver<ActiveStateOp>,
+
+    purge_version: StateVersion,
+    entries: HashMap<StorageKey, ActiveEntry>,
+    entry_key_queue: BinaryHeap<Reverse<(StateVersion, StorageKey)>>,
+    tx_fetch_values: HashMap<StorageKey, oneshot::Sender<Option<Bytes>>>,
+}
+
+enum ActiveStateOp {
+    Fetch(StorageKey, oneshot::Sender<Option<Bytes>>),
+    Install(StorageKey, ActiveEntry),
+    Purge(StateVersion),
+}
+
+impl ActiveStateWorker {
+    fn new(cancel: CancellationToken, rx_op: Receiver<ActiveStateOp>) -> Self {
+        Self {
+            cancel,
+            rx_op,
+            purge_version: 0,
+            entries: Default::default(),
+            entry_key_queue: Default::default(),
+            tx_fetch_values: Default::default(),
+        }
+    }
+
+    async fn run(mut self) -> anyhow::Result<()> {
+        self.cancel
+            .clone()
+            .run_until_cancelled(self.run_inner())
+            .await
+            .unwrap_or(Ok(()))
+    }
+
+    async fn run_inner(&mut self) -> anyhow::Result<()> {
+        while let Some(op) = self.rx_op.recv().await {
+            match op {
+                ActiveStateOp::Fetch(key, tx_value) => {
+                    if let Some(entry) = self.entries.get(&key) {
+                        assert!(entry.version >= self.purge_version);
+                        let _ = tx_value.send(entry.value.clone());
+                    } else {
+                        let replaced = self.tx_fetch_values.insert(key, tx_value);
+                        anyhow::ensure!(replaced.is_none(), "concurrent fetch for the same key");
+                    }
+                }
+                ActiveStateOp::Install(key, entry) => {
+                    if entry.version < self.purge_version {
+                        continue;
+                    }
+                    if let Some(active_entry) = self.entries.get(&key)
+                        && active_entry.version >= entry.version
+                    {
+                        continue;
+                    }
+
+                    if let Some(tx_value) = self.tx_fetch_values.remove(&key) {
+                        let _ = tx_value.send(entry.value.clone());
+                    }
+                    self.entry_key_queue.push(Reverse((entry.version, key)));
+                    self.entries.insert(key, entry);
+                }
+                ActiveStateOp::Purge(version) => {
+                    self.purge_version = version;
+                    while let Some(&Reverse((v, _))) = self.entry_key_queue.peek()
+                        && v < self.purge_version
+                    {
+                        let Reverse((_, key)) = self.entry_key_queue.pop().unwrap();
+                        let Entry::Occupied(entry) = self.entries.entry(key) else {
+                            unreachable!()
+                        };
+                        if entry.get().version == v {
+                            entry.remove();
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 pub struct Storage {
     config: StorageConfig,
     node_indices: Vec<NodeIndex>,
-    db: Arc<DB>,
 
     cancel: CancellationToken,
     rx_op: Receiver<StorageOp>,
@@ -124,12 +302,15 @@ pub struct Storage {
     tx_message: Sender<(SendTo, Message)>,
 
     version: StateVersion,
-    active_state: HashMap<StorageKey, ActiveEntry>,
-    active_versioned_keys: BinaryHeap<Reverse<(StateVersion, StorageKey)>>,
-    fetch_tx_values: HashMap<StorageKey, oneshot::Sender<Option<Bytes>>>,
-    bump_tx_ok: Option<oneshot::Sender<()>>,
-    get_tasks: JoinSet<anyhow::Result<(StorageKey, ActiveEntry)>>,
-    // write_tasks: JoinSet<anyhow::Result<()>>,
+
+    workers: Option<StorageWorkers>,
+    tx_active_state_op: Sender<ActiveStateOp>,
+    tx_shard_worker_ops: HashMap<ShardIndex, Sender<ShardWorkerOp>>,
+}
+
+struct StorageWorkers {
+    active_state_worker: ActiveStateWorker,
+    shard_workers: Vec<ShardWorker>,
 }
 
 #[derive(Clone)]
@@ -153,281 +334,193 @@ impl Storage {
         rx_message: Receiver<Message>,
         tx_message: Sender<(SendTo, Message)>,
     ) -> Self {
+        let (tx_active_state_op, rx_active_state_op) = channel(100);
+        let active_state_worker = ActiveStateWorker::new(cancel.clone(), rx_active_state_op);
+
+        let mut shard_workers = Vec::new();
+        let mut tx_shard_worker_ops = HashMap::new();
+        for shard_index in config.shards_of(&node_indices) {
+            let (tx_op, rx_op) = channel(100);
+            let node = ShardWorker::new(shard_index, db.clone(), cancel.clone(), rx_op);
+            shard_workers.push(node);
+            tx_shard_worker_ops.insert(shard_index, tx_op);
+        }
+
         Self {
             config,
             node_indices,
-            db,
             cancel,
             rx_op,
             rx_message,
             tx_message,
             version: 0,
-            active_state: Default::default(),
-            active_versioned_keys: Default::default(),
-            fetch_tx_values: Default::default(),
-            bump_tx_ok: None,
-            get_tasks: JoinSet::new(),
-            // write_tasks: JoinSet::new(),
+            workers: Some(StorageWorkers {
+                active_state_worker,
+                shard_workers,
+            }),
+            tx_active_state_op,
+            tx_shard_worker_ops,
         }
     }
 
     async fn run(mut self) -> anyhow::Result<()> {
-        self.cancel
-            .clone()
-            .run_until_cancelled(self.run_inner())
-            .await
-            .unwrap_or(Ok(()))?;
-        while self.rx_op.recv().await.is_some() {}
-        tracing::info!(?self.node_indices, "active state size: {}", self.active_state.len());
+        let workers = self.workers.take().unwrap();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(workers.active_state_worker.run());
+        for worker in workers.shard_workers {
+            tasks.spawn(worker.run());
+        }
+        tasks.spawn(async move {
+            self.cancel
+                .clone()
+                .run_until_cancelled(self.run_inner())
+                .await
+                .unwrap_or(Ok(()))
+        });
+        while let Some(result) = tasks.join_next().await {
+            result??
+        }
         Ok(())
     }
 
     async fn run_inner(&mut self) -> anyhow::Result<()> {
         loop {
-            // enum Event<GR, WR> {
-            enum Event<GR> {
+            enum Event {
                 Op(StorageOp),
                 Message(Message),
-                GetResult(GR),
-                // WriteResult(WR),
             }
             match select! {
-                Some(op) = self.rx_op.recv(), if self.bump_tx_ok.is_none() => Event::Op(op),
-                Some(message) = self.rx_message.recv() => Event::Message(message),
-                Some(result) = self.get_tasks.join_next() => Event::GetResult(result),
-                // Some(result) = self.write_tasks.join_next() => Event::WriteResult(result),
+                Some(op) = self.rx_op.recv() => Event::Op(op),
+                Some(msg) = self.rx_message.recv() => Event::Message(msg),
                 else => break,
             } {
-                Event::Op(op) => self.handle_op(op).await?,
-                Event::Message(message) => self.handle_message(message),
-                Event::GetResult(result) => {
-                    let (key, entry) = result??;
-                    self.handle_get_result(key, entry)
-                } // Event::WriteResult(result) => {
-                  //     result??;
-                  //     self.handle_write_result()
-                  // }
+                Event::Op(op) => self.handle_op(op).await,
+                Event::Message(message) => self.handle_message(message).await,
             }
         }
         Ok(())
     }
 
-    async fn handle_op(&mut self, op: StorageOp) -> anyhow::Result<()> {
+    async fn handle_op(&mut self, op: StorageOp) {
         match op {
-            StorageOp::Fetch(storage_key, tx_value) => self.handle_fetch(storage_key, tx_value),
-            StorageOp::Bump(updates, tx_ok) => self.handle_bump(updates, tx_ok),
-            StorageOp::Prefetch(storage_key, tx_ok) => {
-                self.handle_prefetch(storage_key, tx_ok).await
+            StorageOp::Fetch(storage_key, tx_value) => {
+                let _ = self
+                    .tx_active_state_op
+                    .send(ActiveStateOp::Fetch(storage_key, tx_value))
+                    .await;
             }
-        }
-    }
-
-    fn handle_message(&mut self, message: Message) {
-        match message {
-            Message::PushEntry(entry) => self.handle_push_entry(entry),
-        }
-    }
-
-    fn handle_fetch(
-        &mut self,
-        key: StorageKey,
-        tx_value: oneshot::Sender<Option<Bytes>>,
-    ) -> anyhow::Result<()> {
-        if let Some(entry) = self.active_state.get(&key) {
-            assert!(entry.version + self.config.prefetch_offset >= self.version);
-            let _ = tx_value.send(entry.value.clone());
-            return Ok(());
-            // if the fetch is resolved in this way we don't need to push entry (even if we are the
-            // primary). because if the entry is among active state on our side, it must also be
-            // active on the other nodes, and they will resolve the fetch in the same way without
-            // waiting for the push
-        }
-
-        let replaced = self.fetch_tx_values.insert(key, tx_value);
-        anyhow::ensure!(replaced.is_none(), "concurrent fetch for the same key");
-        Ok(())
-    }
-
-    async fn handle_prefetch(
-        &mut self,
-        key: StorageKey,
-        tx_ok: oneshot::Sender<()>,
-    ) -> anyhow::Result<()> {
-        let shard_index = self.config.shard_of(&key);
-        if self
-            .config
-            .nodes_of(shard_index)
-            .any(|node_index| self.node_indices.contains(&node_index))
-        {
-            // let db = self.db.clone();
-            // let version = self.version;
-            // let (tx_snapshot, rx_snapshot) = oneshot::channel();
-            // self.get_tasks.spawn(async move {
-            //     let Some(cf) = db.cf_handle(&format!("segment-{segment_index}")) else {
-            //         anyhow::bail!("missing column family")
-            //     };
-            //     let snapshot = db.snapshot();
-            //     let _ = tx_snapshot.send(());
-            //     let value = snapshot.get_cf(cf, key.0)?;
-            //     let entry = ActiveEntry {
-            //         version,
-            //         value: value.map(Bytes::from),
-            //     };
-            //     Ok((key, entry))
-            // });
-            // let _ = rx_snapshot.await;
-            let Some(cf) = self.db.cf_handle(&format!("shard-{shard_index}")) else {
-                anyhow::bail!("missing column family")
-            };
-            let value = self.db.get_cf(cf, key.0)?;
-            let entry = ActiveEntry {
-                version: self.version,
-                value: value.map(Bytes::from),
-            };
-            self.handle_get_result(key, entry)
-        }
-        let _ = tx_ok.send(());
-        Ok(())
-    }
-
-    fn handle_bump(
-        &mut self,
-        updates: Vec<(StorageKey, Option<Bytes>)>,
-        tx_ok: oneshot::Sender<()>,
-    ) -> anyhow::Result<()> {
-        if !self.fetch_tx_values.is_empty() {
-            warn!("bump before fetch complete");
-            self.fetch_tx_values.clear() // implicitly close result channels
-        }
-
-        self.version += 1;
-        while let Some(&Reverse((version, _))) = self.active_versioned_keys.peek()
-            && version + self.config.prefetch_offset < self.version
-        {
-            let Reverse((_, key)) = self.active_versioned_keys.pop().unwrap();
-            let Entry::Occupied(entry) = self.active_state.entry(key) else {
-                unreachable!()
-            };
-            if entry.get().version == version {
-                entry.remove();
-            }
-        }
-
-        let mut writes = Vec::new();
-        for (key, value) in updates {
-            let shard_index = self.config.shard_of(&key);
-            if self
-                .config
-                .nodes_of(shard_index)
-                .any(|node_index| self.node_indices.contains(&node_index))
-            {
-                writes.push((shard_index, key, value.clone()))
-            }
-
-            let entry = ActiveEntry {
-                version: self.version,
-                value,
-            };
-            self.may_install_entry(key, entry)
-        }
-
-        if writes.is_empty() {
-            let _ = tx_ok.send(());
-        } else {
-            self.bump_tx_ok = Some(tx_ok);
-
-            // let db = self.db.clone();
-            // self.write_tasks.spawn_blocking(move || {
-            //     let mut batch = WriteBatch::new();
-            //     for (segment_index, key, value) in writes {
-            //         let Some(cf) = db.cf_handle(&format!("segment-{segment_index}")) else {
-            //             anyhow::bail!("missing column family")
-            //         };
-            //         match value {
-            //             Some(v) => batch.put_cf(cf, key.0, v),
-            //             None => batch.delete_cf(cf, key.0),
-            //         }
-            //     }
-            //     db.write(batch)?;
-            //     Ok(())
-            // });
-
-            let mut batch = WriteBatch::new();
-            for (shard_index, key, value) in writes {
-                let Some(cf) = self.db.cf_handle(&format!("shard-{shard_index}")) else {
-                    anyhow::bail!("missing column family")
-                };
-                match value {
-                    Some(v) => batch.put_cf(cf, key.0, v),
-                    None => batch.delete_cf(cf, key.0),
+            StorageOp::Bump(updates, tx_ok) => {
+                self.version += 1;
+                let _ = self
+                    .tx_active_state_op
+                    .send(ActiveStateOp::Purge(
+                        self.version - self.config.prefetch_offset,
+                    ))
+                    .await;
+                let mut shard_updates = HashMap::new();
+                for (storage_key, value) in updates {
+                    let active_entry = ActiveEntry {
+                        version: self.version,
+                        value: value.clone(),
+                    };
+                    let _ = self
+                        .tx_active_state_op
+                        .send(ActiveStateOp::Install(storage_key, active_entry))
+                        .await;
+                    shard_updates
+                        .entry(self.config.shard_of(&storage_key))
+                        .or_insert_with(Vec::new)
+                        .push((storage_key, value))
                 }
+
+                for (shard_index, updates) in shard_updates {
+                    let Some(tx_shard_worker_op) = self.tx_shard_worker_ops.get(&shard_index)
+                    else {
+                        continue;
+                    };
+                    let put = Put {
+                        version: self.version,
+                        updates,
+                    };
+                    let (tx_res, rx_res) = oneshot::channel();
+                    let _ = tx_shard_worker_op
+                        .send(ShardWorkerOp::Put(put, tx_res))
+                        .await;
+                    // the underlying worker guarantees to not start Get before finishing
+                    // earlier `Put`s, so its safe to handle Prefetch (and issue Get) before
+                    // Put is done i.e. rx_res is resolved
+                    spawn(
+                        async move {
+                            let Ok(PutRes) = rx_res.await else {
+                                return;
+                            };
+                            // TODO broadcast update info
+                        }
+                        .with_cancellation_token_owned(self.cancel.clone()),
+                    );
+                }
+                let _ = tx_ok.send(());
             }
-            self.db.write(batch)?;
-            self.handle_write_result()
+            StorageOp::Prefetch(storage_key, tx_ok) => {
+                let shard_index = self.config.shard_of(&storage_key);
+                if let Some(tx_shard_worker_op) = self.tx_shard_worker_ops.get(&shard_index) {
+                    let (tx_res, rx_res) = oneshot::channel();
+                    let _ = tx_shard_worker_op
+                        .send(ShardWorkerOp::Get(Get(storage_key), tx_res))
+                        .await;
+                    let tx_active_state_op = self.tx_active_state_op.clone();
+                    let tx_message = if self
+                        .node_indices
+                        .contains(&self.config.primary_node_of(shard_index))
+                    {
+                        Some(self.tx_message.clone())
+                    } else {
+                        None
+                    };
+                    spawn(
+                        async move {
+                            let Ok(get_res) = rx_res.await else {
+                                return;
+                            };
+                            let entry = ActiveEntry {
+                                version: get_res.version,
+                                value: get_res.value.clone(),
+                            };
+                            let _ = tx_active_state_op
+                                .send(ActiveStateOp::Install(storage_key, entry))
+                                .await;
+                            if let Some(tx_message) = tx_message {
+                                let push_entry = message::PushEntry {
+                                    key: storage_key,
+                                    value: get_res.value.map(|v| v.to_vec()),
+                                    version: get_res.version,
+                                };
+                                let _ = tx_message
+                                    .send((SendTo::All, Message::PushEntry(push_entry)))
+                                    .await;
+                            }
+                        }
+                        .with_cancellation_token_owned(self.cancel.clone()),
+                    );
+                }
+                let _ = tx_ok.send(());
+            }
         }
-        Ok(())
     }
 
-    fn handle_get_result(&mut self, key: StorageKey, entry: ActiveEntry) {
-        self.may_push_entry(key, entry.value.clone());
-        self.may_install_entry(key, entry)
-    }
-
-    fn handle_write_result(&mut self) {
-        // if !self.write_tasks.is_empty() {
-        //     return;
-        // }
-        let Some(tx_ok) = self.bump_tx_ok.take() else {
-            unimplemented!()
-        };
-        let _ = tx_ok.send(());
-    }
-
-    fn handle_push_entry(&mut self, push_entry: message::PushEntry) {
-        if push_entry.version + self.config.prefetch_offset < self.version {
-            return;
+    async fn handle_message(&mut self, message: Message) {
+        match message {
+            Message::PushEntry(push_entry) => {
+                let entry = ActiveEntry {
+                    version: push_entry.version,
+                    value: push_entry.value.map(Bytes::from),
+                };
+                let _ = self
+                    .tx_active_state_op
+                    .send(ActiveStateOp::Install(push_entry.key, entry))
+                    .await;
+            }
         }
-
-        let entry = ActiveEntry {
-            version: push_entry.version,
-            value: push_entry.value.map(Bytes::from),
-        };
-        self.may_install_entry(push_entry.key, entry)
-    }
-
-    fn may_install_entry(&mut self, key: StorageKey, entry: ActiveEntry) {
-        if let Some(active_entry) = self.active_state.get(&key)
-            && active_entry.version >= entry.version
-        {
-            return;
-        }
-
-        if let Some(tx_value) = self.fetch_tx_values.remove(&key) {
-            let _ = tx_value.send(entry.value.clone());
-        }
-
-        self.active_versioned_keys
-            .push(Reverse((entry.version, key)));
-        self.active_state.insert(key, entry);
-    }
-
-    fn may_push_entry(&self, key: StorageKey, value: Option<Bytes>) {
-        let shard_index = self.config.shard_of(&key);
-        if !self
-            .node_indices
-            .contains(&self.config.primary_node_of(shard_index))
-        {
-            return;
-        }
-
-        let push_entry = message::PushEntry {
-            key,
-            value: value.map(|v| v.to_vec()),
-            version: self.version,
-        };
-        let _ = self
-            .tx_message
-            .try_send((SendTo::All, Message::PushEntry(push_entry)));
     }
 
     pub fn prefill(

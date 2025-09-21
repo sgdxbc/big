@@ -99,14 +99,18 @@ impl Bench {
                     start = Instant::now();
                     let (tx_value, rx_value) = oneshot::channel();
                     let _ = self.tx_op.send(StorageOp::Fetch(key, tx_value)).await;
-                    let value = rx_value.await?;
+                    let Ok(value) = rx_value.await else {
+                        break;
+                    };
                     anyhow::ensure!(value.is_some(), "key not found");
                     Default::default()
                 }
             };
             let (tx_ok, rx_ok) = oneshot::channel();
             let _ = self.tx_op.send(StorageOp::Bump(updates, tx_ok)).await;
-            rx_ok.await?;
+            let Ok(()) = rx_ok.await else {
+                break;
+            };
             let duration = start.elapsed();
             self.records.push((start, duration));
 
@@ -122,6 +126,7 @@ impl Bench {
                 info!("interval tps: {tps:.2}")
             }
         }
+        Ok(())
     }
 
     async fn push_command(&mut self) -> Result<(), anyhow::Error> {
@@ -134,8 +139,8 @@ impl Bench {
         if matches!(command, Command::Get) {
             let (tx_ok, rx_ok) = oneshot::channel();
             let _ = self.tx_op.send(StorageOp::Prefetch(key, tx_ok)).await;
-            // rx_ok.await?;
-            drop(rx_ok);
+            rx_ok.await?;
+            // drop(rx_ok);
         }
         self.command_queue.push_back((command, key));
         Ok(())

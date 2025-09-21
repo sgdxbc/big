@@ -47,9 +47,7 @@ impl PlainSyncStorage {
             .clone()
             .run_until_cancelled(self.run_inner())
             .await
-            .unwrap_or(Ok(()))?;
-        while self.rx_op.recv().await.is_some() {}
-        Ok(())
+            .unwrap_or(Ok(()))
     }
 
     async fn run_inner(&mut self) -> anyhow::Result<()> {
@@ -123,9 +121,7 @@ impl PlainPrefetchStorage {
             .clone()
             .run_until_cancelled(self.run_inner())
             .await
-            .unwrap_or(Ok(()))?;
-        while self.rx_op.recv().await.is_some() {}
-        Ok(())
+            .unwrap_or(Ok(()))
     }
 
     async fn run_inner(&mut self) -> anyhow::Result<()> {
