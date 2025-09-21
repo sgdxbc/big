@@ -42,13 +42,15 @@ addrs   127.0.0.1:5003
     for node_index in 0..configs.get("big.num-node")? {
         let db_path = temp_dir.path().join(format!("node-{node_index}"));
         fs::create_dir(&db_path).await?;
-        let mut db = DB::open_default(&db_path)?;
+        let db = DB::open_default(&db_path)?;
         Storage::prefill(
-            &mut db,
+            db,
             Bench::prefill_items(configs.extract()?),
             &configs.extract()?,
             [node_index as _].into(),
-        )?;
+        )
+        .await?;
+        let db = DB::open_default(&db_path)?;
         println!("db prefilled for node {node_index}");
         dbs.push(Arc::new(db))
     }

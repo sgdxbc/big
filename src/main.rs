@@ -4,7 +4,7 @@ use big::{
     logging::init_logging_file,
     parse::Configs,
     storage::{
-        StorageConfig, Storage,
+        Storage, StorageConfig,
         bench::{Bench, BenchPlainStorage, BenchStorage},
         plain::PlainStorage,
     },
@@ -51,12 +51,12 @@ async fn role_prefill(configs: Configs, index: u16) -> anyhow::Result<()> {
     options.prepare_for_bulk_load();
     options.create_if_missing(true);
     options.set_max_subcompactions(std::thread::available_parallelism()?.get() as _);
-    let mut db = DB::open(&options, path)?;
+    let db = DB::open(&options, path)?;
     let items = Bench::prefill_items(configs.extract()?);
     if configs.get("big.plain-storage")? {
         PlainStorage::prefill(db, items).await
     } else {
-        Storage::prefill(&mut db, items, &configs.extract()?, [index].into())
+        Storage::prefill(db, items, &configs.extract()?, [index].into()).await
     }
 }
 

@@ -221,6 +221,8 @@ impl PlainPrefetchStorage {
 
 impl PlainStorage {
     pub async fn prefill(
+        // it is possible to take a Arc<DB>, but i explicitly want the DB to be closed (i.e.
+        // dropped) after the prefilling, ensuring the benchmark will start cold
         db: DB,
         items: impl IntoIterator<Item = (StorageKey, Bytes)>,
     ) -> anyhow::Result<()> {

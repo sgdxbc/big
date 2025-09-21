@@ -157,6 +157,9 @@ impl ShardWorker {
     }
 
     async fn run_inner(&mut self) -> anyhow::Result<()> {
+        let prefix = self.index.to_le_bytes();
+        let db_version_key = move || [&prefix[..], b".version"].concat();
+        self.db.put(db_version_key(), b"0")?;
         loop {
             enum Event<R> {
                 Op(ShardWorkerOp),
@@ -167,16 +170,14 @@ impl ShardWorker {
                 Some(result) = self.tasks.join_next() => Event::TaskResult(result),
                 else => break,
             } {
-                Event::Op(ShardWorkerOp::Get(Get(storage_key), tx_res)) => {
-                    let mut key = self.index.to_le_bytes().to_vec();
-                    key.extend_from_slice(&storage_key.0);
+                Event::Op(ShardWorkerOp::Get(Get(key), tx_res)) => {
                     let db = self.db.clone();
                     self.tasks.spawn(async move {
                         let snapshot = db.snapshot();
-                        let Some(version) = snapshot.get_pinned(b".version")? else {
+                        let Some(version) = snapshot.get_pinned(db_version_key())? else {
                             anyhow::bail!("missing version")
                         };
-                        let value = snapshot.get(&key)?;
+                        let value = snapshot.get([&prefix[..], &key.0].concat())?;
                         let res = GetRes {
                             version: str::from_utf8(&version)?.parse()?,
                             value: value.map(Bytes::from),
@@ -187,13 +188,12 @@ impl ShardWorker {
                 }
                 Event::Op(ShardWorkerOp::Put(put, tx_res)) => {
                     let mut batch = WriteBatch::new();
-                    batch.put(b".version", put.version.to_string());
-                    for (storage_key, value) in put.updates {
-                        let mut key = self.index.to_le_bytes().to_vec();
-                        key.extend_from_slice(&storage_key.0);
+                    batch.put(db_version_key(), put.version.to_string());
+                    for (key, value) in put.updates {
+                        let db_key = [&prefix[..], &key.0].concat();
                         match value {
-                            Some(v) => batch.put(&key, &v),
-                            None => batch.delete(&key),
+                            Some(v) => batch.put(&db_key, &v),
+                            None => batch.delete(&db_key),
                         }
                     }
                     // perform write inline in the event loop, blocking the later `Get`s
@@ -523,29 +523,24 @@ impl Storage {
         }
     }
 
-    pub fn prefill(
-        db: &mut DB,
+    pub async fn prefill(
+        db: DB,
         items: impl IntoIterator<Item = (StorageKey, Bytes)>,
         config: &StorageConfig,
         node_indices: Vec<NodeIndex>,
     ) -> anyhow::Result<()> {
-        let shard_indices = config.shards_of(&node_indices).collect::<HashSet<_>>();
-        for shard_index in &shard_indices {
-            db.create_cf(format!("shard-{shard_index}"), &Default::default())?
-        }
-
         let mut items = items.into_iter();
+        let shard_indices = config.shards_of(&node_indices).collect::<HashSet<_>>();
         let mut batch;
+        let mut tasks = JoinSet::new();
+        let db = Arc::new(db);
         while {
             batch = WriteBatch::new();
             // wiki says "hundreds of keys"
             for (key, value) in items.by_ref() {
                 let shard_index = config.shard_of(&key);
                 if shard_indices.contains(&shard_index) {
-                    let Some(cf) = db.cf_handle(&format!("shard-{shard_index}")) else {
-                        unimplemented!()
-                    };
-                    batch.put_cf(cf, key.0, &value);
+                    batch.put([&shard_index.to_le_bytes()[..], &key.0].concat(), &value);
                     if batch.len() == 1000 {
                         break;
                     }
@@ -553,8 +548,19 @@ impl Storage {
             }
             !batch.is_empty()
         } {
-            db.write(batch)?
+            let db = db.clone();
+            tasks.spawn(async move { db.write(batch) });
+            // not 100% cpu utilization, but more concurrency seems not improving
+            if tasks.len() == std::thread::available_parallelism()?.get()
+                && let Some(res) = tasks.join_next().await
+            {
+                res??
+            }
         }
+        while let Some(res) = tasks.join_next().await {
+            res??
+        }
+        db.compact_range::<&[u8], &[u8]>(None, None);
         Ok(())
     }
 }
