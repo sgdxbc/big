@@ -23,7 +23,7 @@ use tokio_util::{future::FutureExt, sync::CancellationToken};
 use tracing::trace;
 
 use self::{
-    archive::{AlignedArchiveWorker, ArchiveWorker, UnalignedArchiveWorker},
+    archive::ArchiveWorker,
     db::{DbGet, DbPut, DbPutRes, DbWorker, DbWorkerOp, VirtualDb},
     message::Message,
 };
@@ -169,6 +169,7 @@ pub struct Storage {
     workers: Option<StorageWorkers>,
     tx_active_state_op: Sender<ActiveStateOp>,
     tx_db_worker_op: Sender<DbWorkerOp>,
+    tx_archive_message: Sender<message::PushShard>,
 }
 
 struct StorageWorkers {
@@ -199,13 +200,14 @@ impl Storage {
         let (tx_archive_op, rx_archive_op) = channel(100);
         let db_worker = DbWorker::new(config.clone(), db.clone(), rx_db_worker_op, tx_archive_op);
 
-        let archive_worker = match config.archive_kind {
-            ArchiveKind::Disabled => ArchiveWorker::Disabled,
-            ArchiveKind::Aligned => {
-                ArchiveWorker::Aligned(AlignedArchiveWorker::new(db, rx_archive_op))
-            }
-            ArchiveKind::Unaligned => ArchiveWorker::Unaligned(UnalignedArchiveWorker::new(db)),
-        };
+        let (tx_archive_message, rx_archive_message) = channel(100);
+        let archive_worker = ArchiveWorker::new(
+            config.clone(),
+            db,
+            rx_archive_op,
+            rx_archive_message,
+            tx_message.clone(),
+        );
 
         let hosting_shard_indices = config.shards_of(&node_indices).collect();
         let archive_voted_rounds = vec![0; config.num_node as _];
@@ -228,6 +230,7 @@ impl Storage {
             }),
             tx_active_state_op,
             tx_db_worker_op,
+            tx_archive_message,
         }
     }
 
@@ -453,6 +456,9 @@ impl Storage {
                     }
                 }
             }
+            Message::PushShard(push_shard) => {
+                let _ = self.tx_archive_message.send(push_shard).await;
+            }
         }
     }
 
@@ -597,7 +603,7 @@ pub mod message {
     use crate::storage::{StateVersion, StorageKey};
 
     use super::{
-        ShardIndex,
+        ArchiveRound, ShardIndex,
         db::{Proof, UpdateInfo},
     };
 
@@ -605,6 +611,7 @@ pub mod message {
     pub enum Message {
         PushEntry(PushEntry),
         PushUpdateInfo(PushUpdateInfo),
+        PushShard(PushShard),
     }
 
     #[derive(Encode, Decode)]
@@ -619,6 +626,13 @@ pub mod message {
     pub struct PushUpdateInfo {
         pub version: StateVersion,
         pub shard_deltas: HashMap<ShardIndex, UpdateInfo>,
+    }
+
+    #[derive(Encode, Decode)]
+    pub struct PushShard {
+        pub round: ArchiveRound,
+        pub shard_index: ShardIndex,
+        pub data: Vec<u8>,
     }
 }
 
