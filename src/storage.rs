@@ -22,9 +22,13 @@ use tokio::{
 use tokio_util::{future::FutureExt, sync::CancellationToken};
 use tracing::trace;
 
-use self::message::Message;
+use self::{
+    db::{DbWorker, DbWorkerOp, DbGet, DbPut, DbPutRes},
+    message::Message,
+};
 
 pub mod bench;
+pub mod db;
 pub mod network;
 pub mod plain;
 
@@ -123,106 +127,6 @@ impl StorageConfig {
             self.nodes_of(shard_index)
                 .any(|node_index| node_indices.contains(&node_index))
         })
-    }
-}
-
-struct DbWorker {
-    config: StorageConfig,
-    db: Arc<DB>,
-
-    // later extend the results of these two with proof and update info
-    rx_op: Receiver<DbWorkerOp>,
-    tasks: JoinSet<anyhow::Result<()>>,
-}
-
-enum DbWorkerOp {
-    Get(Get, oneshot::Sender<GetRes>),
-    Put(Put, oneshot::Sender<PutRes>),
-}
-
-// really unnecessary wrapper, just to keep the pattern consistent
-struct Get(StorageKey);
-
-struct GetRes {
-    version: StateVersion,
-    value: Option<Bytes>,
-    // proof
-}
-
-struct Put {
-    version: StateVersion,
-    updates: Vec<(StorageKey, Option<Bytes>)>,
-}
-
-struct PutRes; // update info
-
-impl DbWorker {
-    fn new(config: StorageConfig, db: Arc<DB>, rx_op: Receiver<DbWorkerOp>) -> Self {
-        Self {
-            config,
-            db,
-            rx_op,
-            tasks: JoinSet::new(),
-        }
-    }
-
-    pub async fn run(mut self, cancel: CancellationToken) -> anyhow::Result<()> {
-        cancel
-            .run_until_cancelled(self.run_inner())
-            .await
-            .unwrap_or(Ok(()))
-    }
-
-    async fn run_inner(&mut self) -> anyhow::Result<()> {
-        self.db.put(".version", 0.to_string())?;
-        loop {
-            enum Event<R> {
-                Op(DbWorkerOp),
-                TaskResult(R),
-            }
-            match select! {
-                Some(op) = self.rx_op.recv() => Event::Op(op),
-                Some(result) = self.tasks.join_next() => Event::TaskResult(result),
-                else => break,
-            } {
-                Event::Op(DbWorkerOp::Get(Get(key), tx_res)) => {
-                    let shard_index = self.config.shard_of(&key);
-                    let db = self.db.clone();
-                    self.tasks.spawn(async move {
-                        let snapshot = db.snapshot();
-                        let Some(version) = snapshot.get_pinned(".version")? else {
-                            anyhow::bail!("missing version")
-                        };
-                        let value =
-                            snapshot.get([&shard_index.to_le_bytes()[..], &key.0].concat())?;
-                        let res = GetRes {
-                            version: str::from_utf8(&version)?.parse()?,
-                            value: value.map(Into::into),
-                        };
-                        let _ = tx_res.send(res);
-                        Ok(())
-                    });
-                }
-                Event::Op(DbWorkerOp::Put(put, tx_res)) => {
-                    let mut batch = WriteBatch::new();
-                    batch.put(".version", put.version.to_string());
-                    for (key, value) in put.updates {
-                        let shard_index = self.config.shard_of(&key);
-                        let db_key = [&shard_index.to_le_bytes()[..], &key.0].concat();
-                        match value {
-                            Some(v) => batch.put(&db_key, &v),
-                            None => batch.delete(&db_key),
-                        }
-                    }
-                    // perform write inline in the event loop, blocking the later `Get`s
-                    // so that any Get received after this Put will see the updated version
-                    self.db.write(batch)?;
-                    let _ = tx_res.send(PutRes);
-                }
-                Event::TaskResult(result) => result??,
-            }
-        }
-        Ok(())
     }
 }
 
@@ -444,7 +348,7 @@ impl Storage {
                 }
 
                 updates.retain(|(key, _)| self.shard_indices.contains(&self.config.shard_of(key)));
-                let put = Put {
+                let put = DbPut {
                     version: self.version,
                     updates,
                 };
@@ -458,7 +362,7 @@ impl Storage {
                 // Put is done i.e. rx_res is resolved
                 spawn(
                     async move {
-                        let Ok(PutRes) = rx_res.await else {
+                        let Ok(DbPutRes) = rx_res.await else {
                             return;
                         };
                         // TODO broadcast update info
@@ -476,7 +380,7 @@ impl Storage {
                     let (tx_res, rx_res) = oneshot::channel();
                     let _ = self
                         .tx_db_worker_op
-                        .send(DbWorkerOp::Get(Get(storage_key), tx_res))
+                        .send(DbWorkerOp::Get(DbGet(storage_key), tx_res))
                         .await;
                     let tx_active_state_op = self.tx_active_state_op.clone();
                     let tx_message = if self
