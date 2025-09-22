@@ -1,5 +1,6 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
+use bincode::{Decode, Encode};
 use bytes::Bytes;
 use rocksdb::{DB, WriteBatch};
 use tokio::{
@@ -9,7 +10,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::{StateVersion, StorageConfig, StorageKey};
+use super::{ShardIndex, StateVersion, StorageConfig, StorageKey};
 
 pub enum DbWorkerOp {
     Get(DbGet, oneshot::Sender<DbGetRes>),
@@ -30,9 +31,11 @@ pub struct DbPut {
     pub updates: Vec<(StorageKey, Option<Bytes>)>,
 }
 
-pub struct DbPutRes(pub UpdateInfo);
+pub struct DbPutRes(pub HashMap<ShardIndex, UpdateInfo>);
 
+#[derive(Encode, Decode)]
 pub struct Proof; // TODO
+#[derive(Encode, Decode)]
 pub struct UpdateInfo; // TODO
 
 pub struct DbWorker {
@@ -106,11 +109,35 @@ impl DbWorker {
                     // perform write inline in the event loop, blocking the later `Get`s
                     // so that any Get received after this Put will see the updated version
                     self.db.write(batch)?;
-                    let _ = tx_res.send(DbPutRes(UpdateInfo));
+                    let _ = tx_res.send(DbPutRes(Default::default()));
                 }
                 Event::TaskResult(result) => result??,
             }
         }
+        Ok(())
+    }
+}
+
+pub struct VirtualDb;
+
+#[allow(unused_variables)]
+impl VirtualDb {
+    pub fn verify(
+        &self,
+        version: StateVersion,
+        key: &StorageKey,
+        value: Option<&[u8]>,
+        &Proof: &Proof,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    pub fn apply(
+        &mut self,
+        shard_index: ShardIndex,
+        version: StateVersion,
+        UpdateInfo: UpdateInfo,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 }
