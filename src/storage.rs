@@ -23,7 +23,7 @@ use tokio_util::{future::FutureExt, sync::CancellationToken};
 use tracing::trace;
 
 use self::{
-    db::{DbWorker, DbWorkerOp, DbGet, DbPut, DbPutRes},
+    db::{DbGet, DbPut, DbPutRes, DbWorker, DbWorkerOp},
     message::Message,
 };
 
@@ -362,7 +362,7 @@ impl Storage {
                 // Put is done i.e. rx_res is resolved
                 spawn(
                     async move {
-                        let Ok(DbPutRes) = rx_res.await else {
+                        let Ok(DbPutRes(_)) = rx_res.await else {
                             return;
                         };
                         // TODO broadcast update info

@@ -11,15 +11,6 @@ use tokio_util::sync::CancellationToken;
 
 use super::{StateVersion, StorageConfig, StorageKey};
 
-pub struct DbWorker {
-    config: StorageConfig,
-    db: Arc<DB>,
-
-    // later extend the results of these two with proof and update info
-    rx_op: Receiver<DbWorkerOp>,
-    tasks: JoinSet<anyhow::Result<()>>,
-}
-
 pub enum DbWorkerOp {
     Get(DbGet, oneshot::Sender<DbGetRes>),
     Put(DbPut, oneshot::Sender<DbPutRes>),
@@ -31,7 +22,7 @@ pub struct DbGet(pub StorageKey);
 pub struct DbGetRes {
     pub version: StateVersion,
     pub value: Option<Bytes>,
-    // proof
+    pub proof: Proof,
 }
 
 pub struct DbPut {
@@ -39,7 +30,19 @@ pub struct DbPut {
     pub updates: Vec<(StorageKey, Option<Bytes>)>,
 }
 
-pub struct DbPutRes; // update info
+pub struct DbPutRes(pub UpdateInfo);
+
+pub struct Proof; // TODO
+pub struct UpdateInfo; // TODO
+
+pub struct DbWorker {
+    config: StorageConfig,
+    db: Arc<DB>,
+
+    // later extend the results of these two with proof and update info
+    rx_op: Receiver<DbWorkerOp>,
+    tasks: JoinSet<anyhow::Result<()>>,
+}
 
 impl DbWorker {
     pub fn new(config: StorageConfig, db: Arc<DB>, rx_op: Receiver<DbWorkerOp>) -> Self {
@@ -83,6 +86,7 @@ impl DbWorker {
                         let res = DbGetRes {
                             version: str::from_utf8(&version)?.parse()?,
                             value: value.map(Into::into),
+                            proof: Proof,
                         };
                         let _ = tx_res.send(res);
                         Ok(())
@@ -102,7 +106,7 @@ impl DbWorker {
                     // perform write inline in the event loop, blocking the later `Get`s
                     // so that any Get received after this Put will see the updated version
                     self.db.write(batch)?;
-                    let _ = tx_res.send(DbPutRes);
+                    let _ = tx_res.send(DbPutRes(UpdateInfo));
                 }
                 Event::TaskResult(result) => result??,
             }
