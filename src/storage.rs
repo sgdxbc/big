@@ -59,8 +59,11 @@ pub enum StorageOp {
     // receiving the next op will do. the result channel is currently for measuring latency in the
     // benchmark
     Bump(BumpUpdates, oneshot::Sender<()>),
+
     // similar to Bump; only start measure latency after Prefetch is done
     Prefetch(StorageKey, oneshot::Sender<()>),
+
+    VoteArchive(NodeIndex, ArchiveRound),
 }
 
 impl Debug for StorageOp {
@@ -69,6 +72,9 @@ impl Debug for StorageOp {
             StorageOp::Fetch(key, _) => write!(f, "Fetch({key:?})"),
             StorageOp::Bump(updates, _) => write!(f, "Bump(len={})", updates.len()),
             StorageOp::Prefetch(key, _) => write!(f, "Prefetch({key:?})"),
+            StorageOp::VoteArchive(node_index, round) => {
+                write!(f, "VoteArchive(node_index={node_index}, round={round})")
+            }
         }
     }
 }
@@ -85,12 +91,15 @@ pub struct StorageConfig {
     num_faulty_node: NodeIndex,
     num_stripe: StripeIndex,
     num_backup: NodeIndex,
+
     // Prefetch that issued at version `v` matches a Fetch at version `v + prefetch_offset`
     // when primary nodes receive Prefetch, they push the prefetched entry to other nodes, so for a
     // Fetch at version `v`, a push of version `v - prefetch_offset` will be received on the nodes
     // the nodes should keep track of the updates for the last `prefetch_offset` versions, and they
     // can rely on the pushes for the even earlier updates
     prefetch_offset: StateVersion,
+
+    bypass_vote: bool,
 }
 
 impl StorageConfig {
@@ -130,90 +139,7 @@ impl StorageConfig {
     }
 }
 
-struct ActiveStateWorker {
-    rx_op: Receiver<ActiveStateOp>,
-
-    purge_version: StateVersion,
-    entries: HashMap<StorageKey, ActiveEntry>,
-    entry_key_queue: BinaryHeap<Reverse<(StateVersion, StorageKey)>>,
-    fetch_tx_values: HashMap<StorageKey, oneshot::Sender<Option<Bytes>>>,
-}
-
-enum ActiveStateOp {
-    Fetch(StorageKey, oneshot::Sender<Option<Bytes>>),
-    Install(StorageKey, ActiveEntry),
-    Purge(StateVersion),
-}
-
-impl ActiveStateWorker {
-    fn new(rx_op: Receiver<ActiveStateOp>) -> Self {
-        Self {
-            rx_op,
-            purge_version: 0,
-            entries: Default::default(),
-            entry_key_queue: Default::default(),
-            fetch_tx_values: Default::default(),
-        }
-    }
-
-    async fn run(mut self, cancel: CancellationToken) -> anyhow::Result<()> {
-        cancel
-            .run_until_cancelled(self.run_inner())
-            .await
-            .unwrap_or(Ok(()))
-    }
-
-    async fn run_inner(&mut self) -> anyhow::Result<()> {
-        while let Some(op) = self.rx_op.recv().await {
-            match op {
-                ActiveStateOp::Fetch(key, tx_value) => {
-                    if let Some(entry) = self.entries.get(&key) {
-                        assert!(entry.version >= self.purge_version);
-                        let _ = tx_value.send(entry.value.clone());
-                    } else {
-                        let replaced = self.fetch_tx_values.insert(key, tx_value);
-                        anyhow::ensure!(replaced.is_none(), "concurrent fetch for the same key");
-                    }
-                }
-                ActiveStateOp::Install(key, entry) => {
-                    trace!(
-                        "installing entry for key {:?} at version {}",
-                        key, entry.version
-                    );
-                    if entry.version < self.purge_version {
-                        continue;
-                    }
-                    if let Some(active_entry) = self.entries.get(&key)
-                        && active_entry.version >= entry.version
-                    {
-                        continue;
-                    }
-
-                    if let Some(tx_value) = self.fetch_tx_values.remove(&key) {
-                        let _ = tx_value.send(entry.value.clone());
-                    }
-                    self.entry_key_queue.push(Reverse((entry.version, key)));
-                    self.entries.insert(key, entry);
-                }
-                ActiveStateOp::Purge(version) => {
-                    self.purge_version = version;
-                    while let Some(&Reverse((v, _))) = self.entry_key_queue.peek()
-                        && v < self.purge_version
-                    {
-                        let Reverse((_, key)) = self.entry_key_queue.pop().unwrap();
-                        let Entry::Occupied(entry) = self.entries.entry(key) else {
-                            unreachable!()
-                        };
-                        if entry.get().version == v {
-                            entry.remove();
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-}
+type ArchiveRound = u64;
 
 pub struct Storage {
     config: StorageConfig,
@@ -225,7 +151,10 @@ pub struct Storage {
     tx_message: Sender<(SendTo, Message)>,
 
     version: StateVersion,
+    // "physical db" is maintained by DbWorker
     virtual_db: VirtualDb,
+    archive_voted_rounds: Vec<ArchiveRound>, // node index -> round
+    archive_quorum_voted_round: ArchiveRound, // cached sorted(voted_rounds)[num_faulty]
     cancel: CancellationToken,
 
     workers: Option<StorageWorkers>,
@@ -234,14 +163,9 @@ pub struct Storage {
 }
 
 struct StorageWorkers {
-    active_state_worker: ActiveStateWorker,
-    db_worker: DbWorker,
-}
-
-#[derive(Clone)]
-struct ActiveEntry {
-    version: StateVersion,
-    value: Option<Bytes>,
+    active_state: ActiveStateWorker,
+    db: DbWorker,
+    // omitted: retrieval responder worker (along with the retrieving logic in Storage)
 }
 
 pub enum SendTo {
@@ -264,19 +188,23 @@ impl Storage {
         let (tx_db_worker_op, rx_db_worker_op) = channel(100);
         let db_worker = DbWorker::new(config.clone(), db, rx_db_worker_op);
 
+        let hosting_shard_indices = config.shards_of(&node_indices).collect();
+        let archive_voted_rounds = vec![0; config.num_node as _];
         Self {
-            hosting_shard_indices: config.shards_of(&node_indices).collect(),
             config,
             node_indices,
+            hosting_shard_indices,
             rx_op,
             rx_message,
             tx_message,
             version: 0,
             virtual_db: VirtualDb,
+            archive_voted_rounds,
+            archive_quorum_voted_round: 0,
             cancel: CancellationToken::new(),
             workers: Some(StorageWorkers {
-                active_state_worker,
-                db_worker,
+                active_state: active_state_worker,
+                db: db_worker,
             }),
             tx_active_state_op,
             tx_db_worker_op,
@@ -295,13 +223,14 @@ impl Storage {
         };
         try_join!(
             task,
-            workers.active_state_worker.run(cancel.clone()),
-            workers.db_worker.run(cancel.clone()),
+            workers.active_state.run(cancel.clone()),
+            workers.db.run(cancel.clone()),
         )?;
         Ok(())
     }
 
     async fn run_inner(&mut self) -> anyhow::Result<()> {
+        self.vote_next_archive_round();
         loop {
             enum Event {
                 Op(StorageOp),
@@ -411,9 +340,6 @@ impl Storage {
                     .tx_db_worker_op
                     .send(DbWorkerOp::Put(put, tx_res))
                     .await;
-                // the underlying worker guarantees to not start Get before finishing
-                // earlier `Put`s, so its safe to handle Prefetch (and issue Get) before
-                // Put is done i.e. rx_res is resolved
                 let config = self.config.clone();
                 let node_indices = self.node_indices.clone();
                 let version = self.version;
@@ -438,7 +364,24 @@ impl Storage {
                     }
                     .with_cancellation_token_owned(self.cancel.clone()),
                 );
+                // the underlying worker guarantees to not start Get before finishing
+                // earlier `Put`s, so its safe to handle Prefetch (and issue Get) before
+                // Put is done i.e. rx_res is resolved
                 let _ = tx_ok.send(());
+            }
+
+            StorageOp::VoteArchive(node_index, round) => {
+                let node_round = &mut self.archive_voted_rounds[node_index as usize];
+                if round > *node_round {
+                    *node_round = round;
+                    let mut voted_rounds = self.archive_voted_rounds.clone();
+                    voted_rounds.sort_unstable();
+                    let quorum_voted_round = voted_rounds[self.config.num_faulty_node as usize];
+                    if quorum_voted_round > self.archive_quorum_voted_round {
+                        self.archive_quorum_voted_round = quorum_voted_round;
+                        // TODO
+                    }
+                }
             }
         }
     }
@@ -490,6 +433,20 @@ impl Storage {
         }
     }
 
+    fn vote_next_archive_round(&mut self) {
+        let round = self.archive_voted_rounds[self.node_indices[0] as usize] + 1;
+        assert!(
+            self.node_indices
+                .iter()
+                .all(|&node_index| { round == self.archive_voted_rounds[node_index as usize] + 1 })
+        );
+        if self.config.bypass_vote {
+            //
+            return;
+        }
+        // TODO
+    }
+
     pub async fn prefill(
         db: DB,
         items: impl IntoIterator<Item = (StorageKey, Bytes)>,
@@ -528,6 +485,97 @@ impl Storage {
             res??
         }
         db.compact_range::<&[u8], &[u8]>(None, None);
+        Ok(())
+    }
+}
+
+struct ActiveStateWorker {
+    rx_op: Receiver<ActiveStateOp>,
+
+    purge_version: StateVersion,
+    entries: HashMap<StorageKey, ActiveEntry>,
+    entry_key_queue: BinaryHeap<Reverse<(StateVersion, StorageKey)>>,
+    fetch_tx_values: HashMap<StorageKey, oneshot::Sender<Option<Bytes>>>,
+}
+
+#[derive(Clone)]
+struct ActiveEntry {
+    version: StateVersion,
+    value: Option<Bytes>,
+}
+
+enum ActiveStateOp {
+    Fetch(StorageKey, oneshot::Sender<Option<Bytes>>),
+    Install(StorageKey, ActiveEntry),
+    Purge(StateVersion),
+}
+
+impl ActiveStateWorker {
+    fn new(rx_op: Receiver<ActiveStateOp>) -> Self {
+        Self {
+            rx_op,
+            purge_version: 0,
+            entries: Default::default(),
+            entry_key_queue: Default::default(),
+            fetch_tx_values: Default::default(),
+        }
+    }
+
+    async fn run(mut self, cancel: CancellationToken) -> anyhow::Result<()> {
+        cancel
+            .run_until_cancelled(self.run_inner())
+            .await
+            .unwrap_or(Ok(()))
+    }
+
+    async fn run_inner(&mut self) -> anyhow::Result<()> {
+        while let Some(op) = self.rx_op.recv().await {
+            match op {
+                ActiveStateOp::Fetch(key, tx_value) => {
+                    if let Some(entry) = self.entries.get(&key) {
+                        assert!(entry.version >= self.purge_version);
+                        let _ = tx_value.send(entry.value.clone());
+                    } else {
+                        let replaced = self.fetch_tx_values.insert(key, tx_value);
+                        anyhow::ensure!(replaced.is_none(), "concurrent fetch for the same key");
+                    }
+                }
+                ActiveStateOp::Install(key, entry) => {
+                    trace!(
+                        "installing entry for key {:?} at version {}",
+                        key, entry.version
+                    );
+                    if entry.version < self.purge_version {
+                        continue;
+                    }
+                    if let Some(active_entry) = self.entries.get(&key)
+                        && active_entry.version >= entry.version
+                    {
+                        continue;
+                    }
+
+                    if let Some(tx_value) = self.fetch_tx_values.remove(&key) {
+                        let _ = tx_value.send(entry.value.clone());
+                    }
+                    self.entry_key_queue.push(Reverse((entry.version, key)));
+                    self.entries.insert(key, entry);
+                }
+                ActiveStateOp::Purge(version) => {
+                    self.purge_version = version;
+                    while let Some(&Reverse((v, _))) = self.entry_key_queue.peek()
+                        && v < self.purge_version
+                    {
+                        let Reverse((_, key)) = self.entry_key_queue.pop().unwrap();
+                        let Entry::Occupied(entry) = self.entries.entry(key) else {
+                            unreachable!()
+                        };
+                        if entry.get().version == v {
+                            entry.remove();
+                        }
+                    }
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -578,6 +626,7 @@ mod parse {
                 num_stripe: configs.get("big.num-stripe")?,
                 num_backup: configs.get("big.num-backup")?,
                 prefetch_offset: configs.get("bench.prefetch-offset")?,
+                bypass_vote: configs.get("big.bypass-vote")?,
             })
         }
     }

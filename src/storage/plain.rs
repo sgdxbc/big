@@ -69,6 +69,7 @@ impl PlainSyncStorage {
                 StorageOp::Prefetch(_, tx_ok) => {
                     let _ = tx_ok.send(());
                 }
+                StorageOp::VoteArchive(..) => unimplemented!(),
             }
         }
         Ok(())
@@ -189,6 +190,7 @@ impl PlainPrefetchStorage {
                         });
                         let _ = tx_ok.send(());
                     }
+                    StorageOp::VoteArchive(..) => unimplemented!(),
                 },
                 Event::TaskResult(result) => {
                     let (storage_key, active_entry) = result??;
