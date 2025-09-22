@@ -120,10 +120,6 @@ impl StorageConfig {
         StdRng::from_seed(key.0).random_range(0..self.num_stripe * self.num_shard_per_stripe())
     }
 
-    // fn stripe_of(&self, shard_index: ShardIndex) -> StripeIndex {
-    //     shard_index / self.num_shard_per_stripe()
-    // }
-
     fn primary_node_of(&self, shard_index: ShardIndex) -> NodeIndex {
         (shard_index % self.num_node as ShardIndex) as _
     }
@@ -140,11 +136,20 @@ impl StorageConfig {
         iter::once(primary).chain(backup)
     }
 
-    fn shards_of(&self, node_indices: &[NodeIndex]) -> impl Iterator<Item = ShardIndex> {
+    fn hosted_by(&self, node_indices: &[NodeIndex]) -> impl Iterator<Item = ShardIndex> {
         (0..self.num_stripe * self.num_shard_per_stripe()).filter(move |&shard_index| {
             self.nodes_of(shard_index)
                 .any(|node_index| node_indices.contains(&node_index))
         })
+    }
+
+    fn stripe_of(&self, shard_index: ShardIndex) -> StripeIndex {
+        shard_index / self.num_shard_per_stripe()
+    }
+
+    fn archived_as(&self, stripe_index: StripeIndex) -> impl Iterator<Item = ShardIndex> {
+        let start = stripe_index * self.num_shard_per_stripe();
+        start..start + self.num_shard_per_stripe()
     }
 }
 
@@ -203,13 +208,14 @@ impl Storage {
         let (tx_archive_message, rx_archive_message) = channel(100);
         let archive_worker = ArchiveWorker::new(
             config.clone(),
+            node_indices.clone(),
             db,
             rx_archive_op,
             rx_archive_message,
             tx_message.clone(),
         );
 
-        let hosting_shard_indices = config.shards_of(&node_indices).collect();
+        let hosting_shard_indices = config.hosted_by(&node_indices).collect();
         let archive_voted_rounds = vec![0; config.num_node as _];
         Self {
             config,
@@ -469,7 +475,7 @@ impl Storage {
         node_indices: Vec<NodeIndex>,
     ) -> anyhow::Result<()> {
         let mut items = items.into_iter();
-        let shard_indices = config.shards_of(&node_indices).collect::<HashSet<_>>();
+        let shard_indices = config.hosted_by(&node_indices).collect::<HashSet<_>>();
         let mut batch;
         let mut tasks = JoinSet::new();
         let db = Arc::new(db);
