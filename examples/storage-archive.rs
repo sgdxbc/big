@@ -3,14 +3,17 @@ use std::{sync::Arc, time::Duration};
 use big::{
     logging::init_logging,
     parse::Configs,
-    storage::{
-        Storage,
-        bench::{Bench, BenchStorage},
-    },
+    storage::{Storage, bench::Bench, network},
 };
 use rocksdb::DB;
 use tempfile::tempdir;
-use tokio::{fs, sync::oneshot, task::JoinSet, time::sleep, try_join};
+use tokio::{
+    fs,
+    sync::{mpsc::channel, oneshot},
+    task::JoinSet,
+    time::sleep,
+    try_join,
+};
 use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
@@ -30,7 +33,6 @@ big.num-faulty-node     1
 # big.num-stripe          1
 big.num-stripe          10
 big.num-backup          0
-# big.archive-kind        disabled
 big.archive-kind        unaligned
 
 addrs   127.0.0.1:5000
@@ -61,20 +63,23 @@ addrs   127.0.0.1:5003
 
     let mut addrs = configs.get_values("addrs")?;
     addrs.truncate(configs.get("big.num-node")?);
+    let mut tx_ops = Vec::new();
     let cancel = CancellationToken::new();
     let mut tasks = JoinSet::new();
     for (node_index, db) in dbs.iter().enumerate() {
-        let bench = BenchStorage::new(
-            node_index as _,
-            addrs.clone(),
-            configs.extract()?,
+        let (tx_op, rx_op) = channel(1);
+        let storage = network::Storage::new(
             configs.extract()?,
             [node_index as _].into(),
             db.clone(),
             (0..configs.get("big.num-node")?).collect(),
+            addrs.clone(),
+            node_index as _,
+            rx_op,
             oneshot::channel().0, // omit observing establishment for local testing
         );
-        tasks.spawn(bench.run(cancel.clone()));
+        tx_ops.push(tx_op);
+        tasks.spawn(storage.run(cancel.clone()));
     }
     let bench = async {
         while let Some(result) = tasks.join_next().await {

@@ -5,7 +5,7 @@ use std::{
 
 use bincode::config::standard;
 use reed_solomon_simd::encode;
-use rocksdb::{DB, DEFAULT_COLUMN_FAMILY_NAME};
+use rocksdb::{DB, ReadOptions, WriteBatch, WriteOptions};
 use sha2::{Digest, Sha256};
 use tokio::{
     select,
@@ -16,7 +16,7 @@ use tokio::{
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::storage::ArchiveKind;
 
@@ -208,7 +208,7 @@ impl Archive {
             .config
             .hosted_by(&self.node_indices)
             .collect::<HashSet<_>>();
-        'outer: for stripe_index in 0..self.config.num_stripe {
+        for stripe_index in 0..self.config.num_stripe {
             let mut shards = BTreeMap::new();
             for shard_index in self.config.archived_as(stripe_index) {
                 if !hosting_shard_indices.contains(&shard_index) {
@@ -216,7 +216,9 @@ impl Archive {
                 }
                 let mut shard = Vec::new();
                 let prefix = shard_index.to_le_bytes();
-                let mut iter = snapshot.raw_iterator();
+                let mut opt = ReadOptions::default();
+                opt.fill_cache(false);
+                let mut iter = snapshot.raw_iterator_opt(opt);
                 iter.seek(prefix);
                 iter.status()?;
                 while let Some((key, value)) = iter.item() {
@@ -253,7 +255,7 @@ impl Archive {
             }
             while shards.len() < self.config.num_shard_per_stripe() as usize {
                 let Some((shard_index, shard)) = self.rx_message.recv().await else {
-                    break 'outer;
+                    return Ok(());
                 };
                 let stripe_index2 = self.config.stripe_of(shard_index);
                 if stripe_index2 < stripe_index {
@@ -273,12 +275,10 @@ impl Archive {
 
             let mut stripe = bincode::encode_to_vec(shards, standard())?;
             let k = self.config.num_shard_per_stripe() as usize;
-            let stripe_len = stripe
-                .len()
-                // reed-solomon-simd requires even-byte sized shards
-                .next_multiple_of(if k % 2 == 0 { k } else { k * 2 });
-            stripe.resize(stripe_len, 0);
-            let original_shards = stripe.chunks(stripe_len / k).collect::<Vec<_>>();
+            // reed-solomon-simd requires even-byte sized shards
+            let chunk_size = (stripe.len().next_multiple_of(k) / k).next_multiple_of(2);
+            stripe.resize(k * chunk_size, 0);
+            let original_shards = stripe.chunks(chunk_size).collect::<Vec<_>>();
             let recovery_shards = encode(
                 k,
                 self.config.num_faulty_node as usize * 2,
@@ -309,16 +309,19 @@ impl Archive {
             self.db.put(
                 [b".archive", &self.round.to_le_bytes()[..], b".digests"].concat(),
                 bincode::encode_to_vec(&shard_digests, standard())?,
-            )?;
+            )?
+            // tokio::time::sleep(std::time::Duration::from_millis(500)).await
         }
-        let Some(cf) = self.db.cf_handle(DEFAULT_COLUMN_FAMILY_NAME) else {
-            unimplemented!()
-        };
-        self.db.delete_range_cf(
-            cf,
+        // DB only has delete_range_cf, so weird
+        let mut batch = WriteBatch::new();
+        batch.delete_range(
             &b".archive"[..],
             &[b".archive", &self.round.to_le_bytes()[..]].concat(),
-        )?;
+        );
+        let mut write_opt = WriteOptions::default();
+        write_opt.set_low_pri(true);
+        self.db.write_opt(batch, &write_opt)?;
+        info!("archive round {} completed", self.round);
         Ok(())
     }
 }

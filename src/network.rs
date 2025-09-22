@@ -91,7 +91,9 @@ impl Network {
                             }
                             Err(err) => Err(err)?,
                         };
-                        send_stream.write_all(&message).await?;
+                        if let Err(err) = send_stream.write_all(&message).await {
+                            warn!("failed to send message to {id:08x}: {err}")
+                        }
                         Ok(())
                     });
                 }
@@ -103,10 +105,12 @@ impl Network {
 
     fn handle_connection(&mut self, id: u32, connection: Connection) {
         self.connections.insert(id, connection.clone());
-        let tx_message = self.tx_message.clone();
-        let tx_close = self.tx_close.clone();
-        self.tasks
-            .spawn(Self::read_connection(id, connection, tx_message, tx_close));
+        self.tasks.spawn(Self::read_connection(
+            id,
+            connection,
+            self.tx_message.clone(),
+            self.tx_close.clone(),
+        ));
     }
 
     async fn read_connection(
