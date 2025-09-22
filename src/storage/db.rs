@@ -5,16 +5,20 @@ use bytes::Bytes;
 use rocksdb::{DB, WriteBatch};
 use tokio::{
     select,
-    sync::{mpsc::Receiver, oneshot},
+    sync::{
+        mpsc::{Receiver, Sender},
+        oneshot,
+    },
     task::JoinSet,
 };
 use tokio_util::sync::CancellationToken;
 
-use super::{ShardIndex, StateVersion, StorageConfig, StorageKey};
+use super::{ArchiveRound, ShardIndex, StateVersion, StorageConfig, StorageKey};
 
 pub enum DbWorkerOp {
     Get(DbGet, oneshot::Sender<DbGetRes>),
     Put(DbPut, oneshot::Sender<DbPutRes>),
+    Archive(ArchiveRound),
 }
 
 // really unnecessary wrapper, just to keep the pattern consistent
@@ -42,17 +46,27 @@ pub struct DbWorker {
     config: StorageConfig,
     db: Arc<DB>,
 
-    // later extend the results of these two with proof and update info
     rx_op: Receiver<DbWorkerOp>,
+    tx_archive_op: Sender<(ArchiveRound, oneshot::Sender<()>)>,
+
+    rx_snapshotted: Option<oneshot::Receiver<()>>,
+
     tasks: JoinSet<anyhow::Result<()>>,
 }
 
 impl DbWorker {
-    pub fn new(config: StorageConfig, db: Arc<DB>, rx_op: Receiver<DbWorkerOp>) -> Self {
+    pub fn new(
+        config: StorageConfig,
+        db: Arc<DB>,
+        rx_op: Receiver<DbWorkerOp>,
+        tx_archive_op: Sender<(ArchiveRound, oneshot::Sender<()>)>,
+    ) -> Self {
         Self {
             config,
             db,
             rx_op,
+            tx_archive_op,
+            rx_snapshotted: None,
             tasks: JoinSet::new(),
         }
     }
@@ -106,10 +120,21 @@ impl DbWorker {
                             None => batch.delete(&db_key),
                         }
                     }
+
+                    if let Some(rx_snapshotted) = self.rx_snapshotted.take() {
+                        let _ = rx_snapshotted.await;
+                    }
+
                     // perform write inline in the event loop, blocking the later `Get`s
                     // so that any Get received after this Put will see the updated version
                     self.db.write(batch)?;
                     let _ = tx_res.send(DbPutRes(Default::default()));
+                }
+                Event::Op(DbWorkerOp::Archive(round)) => {
+                    let (tx_snapshotted, rx_snapshotted) = oneshot::channel();
+                    let _ = self.tx_archive_op.send((round, tx_snapshotted)).await;
+                    let replaced = self.rx_snapshotted.replace(rx_snapshotted);
+                    assert!(replaced.is_none(), "concurrent archive requests")
                 }
                 Event::TaskResult(result) => result??,
             }

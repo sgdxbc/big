@@ -23,10 +23,12 @@ use tokio_util::{future::FutureExt, sync::CancellationToken};
 use tracing::trace;
 
 use self::{
+    archive::{AlignedArchiveWorker, ArchiveWorker, UnalignedArchiveWorker},
     db::{DbGet, DbPut, DbPutRes, DbWorker, DbWorkerOp, VirtualDb},
     message::Message,
 };
 
+pub mod archive;
 pub mod bench;
 pub mod db;
 pub mod network;
@@ -99,7 +101,14 @@ pub struct StorageConfig {
     // can rely on the pushes for the even earlier updates
     prefetch_offset: StateVersion,
 
-    bypass_vote: bool,
+    archive_kind: ArchiveKind,
+}
+
+#[derive(Clone)]
+enum ArchiveKind {
+    Disabled,
+    Aligned,
+    Unaligned,
 }
 
 impl StorageConfig {
@@ -165,6 +174,7 @@ pub struct Storage {
 struct StorageWorkers {
     active_state: ActiveStateWorker,
     db: DbWorker,
+    archive: ArchiveWorker,
     // omitted: retrieval responder worker (along with the retrieving logic in Storage)
 }
 
@@ -186,7 +196,16 @@ impl Storage {
         let active_state_worker = ActiveStateWorker::new(rx_active_state_op);
 
         let (tx_db_worker_op, rx_db_worker_op) = channel(100);
-        let db_worker = DbWorker::new(config.clone(), db, rx_db_worker_op);
+        let (tx_archive_op, rx_archive_op) = channel(100);
+        let db_worker = DbWorker::new(config.clone(), db.clone(), rx_db_worker_op, tx_archive_op);
+
+        let archive_worker = match config.archive_kind {
+            ArchiveKind::Disabled => ArchiveWorker::Disabled,
+            ArchiveKind::Aligned => {
+                ArchiveWorker::Aligned(AlignedArchiveWorker::new(db, rx_archive_op))
+            }
+            ArchiveKind::Unaligned => ArchiveWorker::Unaligned(UnalignedArchiveWorker::new(db)),
+        };
 
         let hosting_shard_indices = config.shards_of(&node_indices).collect();
         let archive_voted_rounds = vec![0; config.num_node as _];
@@ -205,6 +224,7 @@ impl Storage {
             workers: Some(StorageWorkers {
                 active_state: active_state_worker,
                 db: db_worker,
+                archive: archive_worker,
             }),
             tx_active_state_op,
             tx_db_worker_op,
@@ -214,23 +234,23 @@ impl Storage {
     async fn run(mut self, cancel: CancellationToken) -> anyhow::Result<()> {
         let workers = self.workers.take().unwrap();
         let task = async {
+            let _drop_guard = self.cancel.clone().drop_guard();
             cancel
                 .run_until_cancelled(self.run_inner())
                 .await
                 .unwrap_or(Ok(()))?;
-            self.cancel.cancel();
             Ok(())
         };
         try_join!(
             task,
             workers.active_state.run(cancel.clone()),
             workers.db.run(cancel.clone()),
+            workers.archive.run(cancel.clone()),
         )?;
         Ok(())
     }
 
     async fn run_inner(&mut self) -> anyhow::Result<()> {
-        self.vote_next_archive_round();
         loop {
             enum Event {
                 Op(StorageOp),
@@ -379,7 +399,10 @@ impl Storage {
                     let quorum_voted_round = voted_rounds[self.config.num_faulty_node as usize];
                     if quorum_voted_round > self.archive_quorum_voted_round {
                         self.archive_quorum_voted_round = quorum_voted_round;
-                        // TODO
+                        let _ = self
+                            .tx_db_worker_op
+                            .send(DbWorkerOp::Archive(quorum_voted_round))
+                            .await;
                     }
                 }
             }
@@ -431,20 +454,6 @@ impl Storage {
                 }
             }
         }
-    }
-
-    fn vote_next_archive_round(&mut self) {
-        let round = self.archive_voted_rounds[self.node_indices[0] as usize] + 1;
-        assert!(
-            self.node_indices
-                .iter()
-                .all(|&node_index| { round == self.archive_voted_rounds[node_index as usize] + 1 })
-        );
-        if self.config.bypass_vote {
-            //
-            return;
-        }
-        // TODO
     }
 
     pub async fn prefill(
@@ -616,7 +625,7 @@ pub mod message {
 mod parse {
     use crate::parse::Extract;
 
-    use super::StorageConfig;
+    use super::{ArchiveKind, StorageConfig};
 
     impl Extract for StorageConfig {
         fn extract(configs: &crate::parse::Configs) -> anyhow::Result<Self> {
@@ -626,8 +635,20 @@ mod parse {
                 num_stripe: configs.get("big.num-stripe")?,
                 num_backup: configs.get("big.num-backup")?,
                 prefetch_offset: configs.get("bench.prefetch-offset")?,
-                bypass_vote: configs.get("big.bypass-vote")?,
+                archive_kind: configs.extract()?,
             })
+        }
+    }
+
+    impl Extract for ArchiveKind {
+        fn extract(configs: &crate::parse::Configs) -> anyhow::Result<Self> {
+            let kind = match &*configs.get::<String>("big.archive-kind")? {
+                "disabled" => ArchiveKind::Disabled,
+                "aligned" => ArchiveKind::Aligned,
+                "unaligned" => ArchiveKind::Unaligned,
+                other => anyhow::bail!("invalid archive kind: {other}"),
+            };
+            Ok(kind)
         }
     }
 }

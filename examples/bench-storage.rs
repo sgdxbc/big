@@ -30,6 +30,7 @@ big.num-faulty-node     1
 # big.num-stripe          1
 big.num-stripe          10
 big.num-backup          0
+big.archive-kind        disabled
 
 addrs   127.0.0.1:5000
 addrs   127.0.0.1:5001
