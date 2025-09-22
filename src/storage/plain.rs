@@ -22,10 +22,10 @@ pub enum PlainStorage {
 }
 
 impl PlainStorage {
-    pub async fn run(self) -> anyhow::Result<()> {
+    pub async fn run(self, cancel: CancellationToken) -> anyhow::Result<()> {
         match self {
-            Self::Sync(mut s) => s.run().await,
-            Self::Prefetch(mut s) => s.run().await,
+            Self::Sync(mut s) => s.run(cancel).await,
+            Self::Prefetch(mut s) => s.run(cancel).await,
         }
     }
 }
@@ -33,18 +33,16 @@ impl PlainStorage {
 pub struct PlainSyncStorage {
     db: Arc<DB>,
 
-    cancel: CancellationToken,
     rx_op: Receiver<StorageOp>,
 }
 
 impl PlainSyncStorage {
-    pub fn new(db: Arc<DB>, cancel: CancellationToken, rx_op: Receiver<StorageOp>) -> Self {
-        Self { db, cancel, rx_op }
+    pub fn new(db: Arc<DB>, rx_op: Receiver<StorageOp>) -> Self {
+        Self { db, rx_op }
     }
 
-    pub async fn run(&mut self) -> anyhow::Result<()> {
-        self.cancel
-            .clone()
+    pub async fn run(&mut self, cancel: CancellationToken) -> anyhow::Result<()> {
+        cancel
             .run_until_cancelled(self.run_inner())
             .await
             .unwrap_or(Ok(()))
@@ -83,7 +81,6 @@ pub struct PlainPrefetchStorage {
     db: Arc<DB>,
     prefetch_offset: StateVersion,
 
-    cancel: CancellationToken,
     rx_op: Receiver<StorageOp>,
 
     version: StateVersion,
@@ -99,16 +96,10 @@ struct ActiveEntry {
 }
 
 impl PlainPrefetchStorage {
-    pub fn new(
-        db: Arc<DB>,
-        prefetch_offset: StateVersion,
-        cancel: CancellationToken,
-        rx_op: Receiver<StorageOp>,
-    ) -> Self {
+    pub fn new(db: Arc<DB>, prefetch_offset: StateVersion, rx_op: Receiver<StorageOp>) -> Self {
         Self {
             db,
             prefetch_offset,
-            cancel,
             rx_op,
             version: 0,
             active_entries: Default::default(),
@@ -118,9 +109,8 @@ impl PlainPrefetchStorage {
         }
     }
 
-    pub async fn run(&mut self) -> anyhow::Result<()> {
-        self.cancel
-            .clone()
+    pub async fn run(&mut self, cancel: CancellationToken) -> anyhow::Result<()> {
+        cancel
             .run_until_cancelled(self.run_inner())
             .await
             .unwrap_or(Ok(()))

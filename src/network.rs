@@ -19,7 +19,6 @@ use crate::cert::{client_config, server_config};
 pub type NetworkId = u32;
 
 pub struct Network {
-    cancel: CancellationToken,
     rx_peer: Receiver<(NetworkId, Connection, oneshot::Sender<()>)>,
     rx_message: Receiver<(NetworkId, Bytes)>,
     tx_message: Sender<(NetworkId, Vec<u8>)>,
@@ -32,14 +31,12 @@ pub struct Network {
 
 impl Network {
     pub fn new(
-        cancel: CancellationToken,
         rx_peer: Receiver<(NetworkId, Connection, oneshot::Sender<()>)>,
         rx_message: Receiver<(NetworkId, Bytes)>,
         tx_message: Sender<(NetworkId, Vec<u8>)>,
     ) -> Self {
         let (tx_close, rx_close) = channel(1);
         Self {
-            cancel,
             rx_peer,
             rx_message,
             tx_message,
@@ -50,9 +47,8 @@ impl Network {
         }
     }
 
-    pub async fn run(mut self) -> anyhow::Result<()> {
-        self.cancel
-            .clone()
+    pub async fn run(mut self, cancel: CancellationToken) -> anyhow::Result<()> {
+        cancel
             .run_until_cancelled(self.run_inner())
             .await
             .unwrap_or(Ok(()))

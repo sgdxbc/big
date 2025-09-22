@@ -90,6 +90,7 @@ async fn role_bench(configs: Configs, index: u16) -> anyhow::Result<()> {
             anyhow::Ok(())
         }
     };
+
     let mut options = Options::default();
     // let (mut options, cf_descs) = Options::load_latest(
     //     temp_dir.path(),
@@ -106,9 +107,9 @@ async fn role_bench(configs: Configs, index: u16) -> anyhow::Result<()> {
         //     temp_dir.path(),
         //     cf_descs,
         // )?);
-        let bench = BenchPlainStorage::new(true, configs.extract()?, db.clone(), cancel);
+        let bench = BenchPlainStorage::new(true, configs.extract()?, db.clone());
         let _ = tx_start.send(());
-        try_join!(bench.run(), timeout)?;
+        try_join!(bench.run(cancel), timeout)?;
     } else {
         let mut addrs = configs.get_values("addrs")?;
         addrs.truncate(configs.get("big.num-node")?);
@@ -120,10 +121,9 @@ async fn role_bench(configs: Configs, index: u16) -> anyhow::Result<()> {
             vec![index],
             db.clone(),
             (0..configs.get("big.num-node")?).collect(),
-            cancel,
             tx_start,
         );
-        try_join!(bench.run(), timeout)?;
+        try_join!(bench.run(cancel), timeout)?;
     }
     if let Some(stats) = db.property_value("rocksdb.stats")? {
         info!("rocksdb.stats\n{stats}")

@@ -36,7 +36,6 @@ pub struct BenchConfig {
 pub struct Bench {
     config: BenchConfig,
 
-    cancel: CancellationToken,
     tx_op: Sender<StorageOp>,
 
     rng: StdRng,
@@ -50,10 +49,9 @@ enum Command {
 }
 
 impl Bench {
-    pub fn new(config: BenchConfig, cancel: CancellationToken, tx_op: Sender<StorageOp>) -> Self {
+    pub fn new(config: BenchConfig, tx_op: Sender<StorageOp>) -> Self {
         Self {
             config,
-            cancel,
             tx_op,
             rng: StdRng::seed_from_u64(117418),
             command_queue: Default::default(),
@@ -61,9 +59,8 @@ impl Bench {
         }
     }
 
-    pub async fn run(mut self) -> anyhow::Result<()> {
-        self.cancel
-            .clone()
+    pub async fn run(mut self, cancel: CancellationToken) -> anyhow::Result<()> {
+        cancel
             .run_until_cancelled(self.run_inner())
             .await
             .unwrap_or(Ok(()))?;
@@ -73,6 +70,8 @@ impl Bench {
             let tps = ops / total.as_secs_f64();
             let mean = self.records.iter().map(|r| r.1).sum::<Duration>() / ops as u32;
             println!("ops: {ops}, total: {total:.1?}, tps: {tps:.2}, mean latency: {mean:?}")
+        } else {
+            println!("no operations performed")
         }
         Ok(())
     }
@@ -139,7 +138,9 @@ impl Bench {
         if matches!(command, Command::Get) {
             let (tx_ok, rx_ok) = oneshot::channel();
             let _ = self.tx_op.send(StorageOp::Prefetch(key, tx_ok)).await;
-            rx_ok.await?
+            // may should propagate to abort workload loop, but outer loop will abort itself for a
+            // later broken result channel for Fetch or Bump anyway
+            let _ = rx_ok.await;
         }
         self.command_queue.push_back((command, key));
         Ok(())
@@ -166,32 +167,25 @@ pub struct BenchPlainStorage {
 }
 
 impl BenchPlainStorage {
-    pub fn new(
-        prefetch: bool,
-        config: BenchConfig,
-        db: Arc<DB>,
-        cancel: CancellationToken,
-    ) -> Self {
+    pub fn new(prefetch: bool, config: BenchConfig, db: Arc<DB>) -> Self {
         let (tx_op, rx_op) = channel(1);
         let plain_storage = if prefetch {
-            PlainStorage::Prefetch(PlainPrefetchStorage::new(
-                db,
-                config.prefetch_offset,
-                cancel.clone(),
-                rx_op,
-            ))
+            PlainStorage::Prefetch(PlainPrefetchStorage::new(db, config.prefetch_offset, rx_op))
         } else {
-            PlainStorage::Sync(PlainSyncStorage::new(db, cancel.clone(), rx_op))
+            PlainStorage::Sync(PlainSyncStorage::new(db, rx_op))
         };
-        let bench = Bench::new(config, cancel, tx_op);
+        let bench = Bench::new(config, tx_op);
         Self {
             bench,
             plain_storage,
         }
     }
 
-    pub async fn run(self) -> anyhow::Result<()> {
-        try_join!(self.plain_storage.run(), self.bench.run())?;
+    pub async fn run(self, cancel: CancellationToken) -> anyhow::Result<()> {
+        try_join!(
+            self.plain_storage.run(cancel.clone()),
+            self.bench.run(cancel)
+        )?;
         Ok(())
     }
 }
@@ -210,12 +204,11 @@ impl BenchStorage {
         node_indices: Vec<NodeIndex>,
         db: Arc<DB>,
         node_table: Vec<NetworkId>,
-        cancel: CancellationToken,
         tx_start: oneshot::Sender<()>,
     ) -> Self {
         let (tx_op, rx_op) = channel(1);
 
-        let bench = Bench::new(bench_config, cancel.clone(), tx_op);
+        let bench = Bench::new(bench_config, tx_op);
         let storage = Storage::new(
             storage_config,
             node_indices,
@@ -223,15 +216,14 @@ impl BenchStorage {
             node_table,
             addrs,
             network_id,
-            cancel,
             rx_op,
             tx_start,
         );
         Self { bench, storage }
     }
 
-    pub async fn run(self) -> anyhow::Result<()> {
-        try_join!(self.storage.run(), self.bench.run())?;
+    pub async fn run(self, cancel: CancellationToken) -> anyhow::Result<()> {
+        try_join!(self.storage.run(cancel.clone()), self.bench.run(cancel))?;
         Ok(())
     }
 }

@@ -70,10 +70,9 @@ addrs   127.0.0.1:5003
             [node_index as _].into(),
             db.clone(),
             (0..configs.get("big.num-node")?).collect(),
-            cancel.clone(),
             oneshot::channel().0, // omit observing establishment for local testing
         );
-        tasks.spawn(bench.run());
+        tasks.spawn(bench.run(cancel.clone()));
     }
     let bench = async {
         while let Some(result) = tasks.join_next().await {

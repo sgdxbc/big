@@ -34,7 +34,7 @@ pub type NodeIndex = u16;
 pub struct StorageKey([u8; 32]);
 
 impl StorageKey {
-    fn to_hex(&self) -> String {
+    fn to_hex(self) -> String {
         self.0.iter().map(|b| format!("{b:02x}")).collect()
     }
 }
@@ -130,7 +130,6 @@ struct DbWorker {
     config: StorageConfig,
     db: Arc<DB>,
 
-    cancel: CancellationToken,
     // later extend the results of these two with proof and update info
     rx_op: Receiver<DbWorkerOp>,
     tasks: JoinSet<anyhow::Result<()>>,
@@ -158,24 +157,17 @@ struct Put {
 struct PutRes; // update info
 
 impl DbWorker {
-    fn new(
-        config: StorageConfig,
-        db: Arc<DB>,
-        cancel: CancellationToken,
-        rx_op: Receiver<DbWorkerOp>,
-    ) -> Self {
+    fn new(config: StorageConfig, db: Arc<DB>, rx_op: Receiver<DbWorkerOp>) -> Self {
         Self {
             config,
             db,
-            cancel,
             rx_op,
             tasks: JoinSet::new(),
         }
     }
 
-    pub async fn run(mut self) -> anyhow::Result<()> {
-        self.cancel
-            .clone()
+    pub async fn run(mut self, cancel: CancellationToken) -> anyhow::Result<()> {
+        cancel
             .run_until_cancelled(self.run_inner())
             .await
             .unwrap_or(Ok(()))
@@ -235,7 +227,6 @@ impl DbWorker {
 }
 
 struct ActiveStateWorker {
-    cancel: CancellationToken,
     rx_op: Receiver<ActiveStateOp>,
 
     purge_version: StateVersion,
@@ -251,9 +242,8 @@ enum ActiveStateOp {
 }
 
 impl ActiveStateWorker {
-    fn new(cancel: CancellationToken, rx_op: Receiver<ActiveStateOp>) -> Self {
+    fn new(rx_op: Receiver<ActiveStateOp>) -> Self {
         Self {
-            cancel,
             rx_op,
             purge_version: 0,
             entries: Default::default(),
@@ -262,9 +252,8 @@ impl ActiveStateWorker {
         }
     }
 
-    async fn run(mut self) -> anyhow::Result<()> {
-        self.cancel
-            .clone()
+    async fn run(mut self, cancel: CancellationToken) -> anyhow::Result<()> {
+        cancel
             .run_until_cancelled(self.run_inner())
             .await
             .unwrap_or(Ok(()))
@@ -327,12 +316,12 @@ pub struct Storage {
     node_indices: Vec<NodeIndex>,
     shard_indices: HashSet<ShardIndex>,
 
-    cancel: CancellationToken,
     rx_op: Receiver<StorageOp>,
     rx_message: Receiver<Message>,
     tx_message: Sender<(SendTo, Message)>,
 
     version: StateVersion,
+    cancel: CancellationToken,
 
     workers: Option<StorageWorkers>,
     tx_active_state_op: Sender<ActiveStateOp>,
@@ -360,26 +349,25 @@ impl Storage {
         config: StorageConfig,
         node_indices: Vec<NodeIndex>,
         db: Arc<DB>,
-        cancel: CancellationToken,
         rx_op: Receiver<StorageOp>,
         rx_message: Receiver<Message>,
         tx_message: Sender<(SendTo, Message)>,
     ) -> Self {
         let (tx_active_state_op, rx_active_state_op) = channel(100);
-        let active_state_worker = ActiveStateWorker::new(cancel.clone(), rx_active_state_op);
+        let active_state_worker = ActiveStateWorker::new(rx_active_state_op);
 
         let (tx_db_worker_op, rx_db_worker_op) = channel(100);
-        let db_worker = DbWorker::new(config.clone(), db, cancel.clone(), rx_db_worker_op);
+        let db_worker = DbWorker::new(config.clone(), db, rx_db_worker_op);
 
         Self {
             shard_indices: config.shards_of(&node_indices).collect(),
             config,
             node_indices,
-            cancel,
             rx_op,
             rx_message,
             tx_message,
             version: 0,
+            cancel: CancellationToken::new(),
             workers: Some(StorageWorkers {
                 active_state_worker,
                 db_worker,
@@ -389,19 +377,20 @@ impl Storage {
         }
     }
 
-    async fn run(mut self) -> anyhow::Result<()> {
+    async fn run(mut self, cancel: CancellationToken) -> anyhow::Result<()> {
         let workers = self.workers.take().unwrap();
-        let task = async move {
-            self.cancel
-                .clone()
+        let task = async {
+            cancel
                 .run_until_cancelled(self.run_inner())
                 .await
-                .unwrap_or(Ok(()))
+                .unwrap_or(Ok(()))?;
+            self.cancel.cancel();
+            Ok(())
         };
         try_join!(
             task,
-            workers.active_state_worker.run(),
-            workers.db_worker.run(),
+            workers.active_state_worker.run(cancel.clone()),
+            workers.db_worker.run(cancel.clone()),
         )?;
         Ok(())
     }
@@ -450,7 +439,7 @@ impl Storage {
                     };
                     let _ = self
                         .tx_active_state_op
-                        .send(ActiveStateOp::Install(storage_key.clone(), active_entry))
+                        .send(ActiveStateOp::Install(*storage_key, active_entry))
                         .await;
                 }
 

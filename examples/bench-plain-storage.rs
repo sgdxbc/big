@@ -38,14 +38,13 @@ bench.prefetch-offset 10
         args().nth(1).as_deref() == Some("prefetch"),
         configs.extract()?,
         db.into(),
-        cancel.clone(),
     );
     let timeout = async {
         sleep(Duration::from_secs(10)).await;
         cancel.cancel();
         anyhow::Ok(())
     };
-    try_join!(bench.run(), timeout)?;
+    try_join!(bench.run(cancel.clone()), timeout)?;
 
     temp_dir.close()?;
     Ok(())
