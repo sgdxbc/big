@@ -43,14 +43,20 @@ pub struct Narwhal {
 
     tx_block: Sender<Block>,
     rx_message: Receiver<Message>,
-    tx_message: Sender<Message>, // always broadcast
+    tx_message: Sender<(SendTo, Message)>,
 
     workers: Option<Workers>,
+}
+
+pub enum SendTo {
+    All,
+    Node(NodeIndex),
 }
 
 struct Workers {
     propose: Propose,
     certify: Certify,
+    validate: Validate,
 }
 
 pub struct Block {
@@ -96,10 +102,11 @@ impl Narwhal {
         rx_txn: Receiver<Bytes>,
         tx_block: Sender<Block>,
         rx_message: Receiver<Message>,
-        tx_message: Sender<Message>,
+        tx_message: Sender<(SendTo, Message)>,
     ) -> Self {
         let (tx_cert, rx_cert) = channel(100);
         let (tx_proposed_block, rx_proposed_block) = channel(100);
+        let (tx_round, rx_round) = channel(100);
         let propose = Propose::new(
             config.clone(),
             node_index,
@@ -108,6 +115,7 @@ impl Narwhal {
             rx_cert,
             tx_message.clone(),
             tx_proposed_block,
+            tx_round,
         );
         let (tx_block_ok, rx_block_ok) = channel(100);
         let (tx_certified, rx_certified) = channel(100);
@@ -118,13 +126,19 @@ impl Narwhal {
             rx_block_ok,
             tx_certified,
         );
+        let (tx_received_block, rx_received_block) = channel(100);
+        let validate = Validate::new(node_index, rx_round, rx_received_block, tx_message.clone());
         Self {
             config,
             node_index,
             tx_block,
             rx_message,
             tx_message,
-            workers: Some(Workers { propose, certify }),
+            workers: Some(Workers {
+                propose,
+                certify,
+                validate,
+            }),
         }
     }
 
@@ -136,7 +150,12 @@ impl Narwhal {
                 .await
                 .unwrap_or(Ok(()))
         };
-        try_join!(task, workers.propose.run(cancel.clone()))?;
+        try_join!(
+            task,
+            workers.propose.run(cancel.clone()),
+            workers.certify.run(cancel.clone()),
+            workers.validate.run(cancel.clone()),
+        )?;
         Ok(())
     }
 
@@ -152,8 +171,9 @@ struct Propose {
 
     rx_txn: Receiver<Bytes>,
     rx_cert: Receiver<message::Cert>,
-    tx_message: Sender<Message>,
-    tx_proposed_block: Sender<(Round, BlockHash)>,
+    tx_message: Sender<(SendTo, Message)>,
+    tx_proposed: Sender<(Round, BlockHash)>,
+    tx_round: Sender<Round>,
 
     round: Round,
     txn_pool: Vec<Bytes>,
@@ -167,8 +187,9 @@ impl Propose {
         bias_bullshark_anchor: bool,
         rx_txn: Receiver<Bytes>,
         rx_cert: Receiver<message::Cert>,
-        tx_message: Sender<Message>,
-        tx_proposed_block: Sender<(Round, BlockHash)>,
+        tx_message: Sender<(SendTo, Message)>,
+        tx_proposed: Sender<(Round, BlockHash)>,
+        tx_round: Sender<Round>,
     ) -> Self {
         Self {
             config,
@@ -177,7 +198,8 @@ impl Propose {
             rx_txn,
             rx_cert,
             tx_message,
-            tx_proposed_block,
+            tx_proposed,
+            tx_round,
             round: 0,
             txn_pool: Default::default(),
             certs: Default::default(),
@@ -208,8 +230,11 @@ impl Propose {
                 txns: self.txn_pool.drain(..).map(Into::into).collect(),
             };
             let block_hash = Block::from_network(&block).hash();
-            let _ = self.tx_proposed_block.send((self.round, block_hash)).await;
-            let _ = self.tx_message.send(Message::Block(block)).await;
+            let _ = self.tx_proposed.send((self.round, block_hash)).await;
+            let _ = self
+                .tx_message
+                .send((SendTo::All, Message::Block(block)))
+                .await;
             loop {
                 enum Event {
                     Txn(Bytes),
@@ -244,6 +269,7 @@ impl Propose {
                                 )
                             }
                             self.round = cert_round + 1;
+                            let _ = self.tx_round.send(self.round).await;
                             self.certs.retain(|&r, _| r >= cert_round);
                             continue 'outer;
                         }
@@ -259,7 +285,7 @@ struct Certify {
     config: NarwhalConfig,
     node_index: NodeIndex,
 
-    rx_block: Receiver<(Round, BlockHash)>,
+    rx_proposed: Receiver<(Round, BlockHash)>,
     rx_block_ok: Receiver<message::BlockOk>,
     tx_certified: Sender<(BlockHash, message::Cert)>,
 
@@ -276,14 +302,14 @@ impl Certify {
     fn new(
         config: NarwhalConfig,
         node_index: NodeIndex,
-        rx_block: Receiver<(Round, BlockHash)>,
+        rx_proposed: Receiver<(Round, BlockHash)>,
         rx_block_ok: Receiver<message::BlockOk>,
         tx_certified: Sender<(BlockHash, message::Cert)>,
     ) -> Self {
         Self {
             config,
             node_index,
-            rx_block,
+            rx_proposed,
             rx_block_ok,
             tx_certified,
             certifying: None,
@@ -304,7 +330,7 @@ impl Certify {
                 BlockOk(message::BlockOk),
             }
             match select! {
-                Some(block) = self.rx_block.recv() => Event::Block(block),
+                Some(block) = self.rx_proposed.recv() => Event::Block(block),
                 Some(block_ok) = self.rx_block_ok.recv() => Event::BlockOk(block_ok),
                 else => break,
             } {
@@ -349,6 +375,92 @@ impl Certify {
                         };
                         let _ = self.tx_certified.send((certifying.block_hash, cert)).await;
                     }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+struct Validate {
+    node_index: NodeIndex,
+
+    rx_round: Receiver<Round>,
+    rx_block: Receiver<message::Block>,
+    tx_message: Sender<(SendTo, Message)>,
+
+    round: Round,
+    proposed_blocks: HashMap<Round, HashMap<NodeIndex, BlockHash>>,
+}
+
+impl Validate {
+    fn new(
+        node_index: NodeIndex,
+        rx_round: Receiver<Round>,
+        rx_block: Receiver<message::Block>,
+        tx_message: Sender<(SendTo, Message)>,
+    ) -> Self {
+        Self {
+            node_index,
+            rx_round,
+            rx_block,
+            tx_message,
+            round: 0,
+            proposed_blocks: Default::default(),
+        }
+    }
+
+    async fn run(mut self, cancel: CancellationToken) -> anyhow::Result<()> {
+        cancel
+            .run_until_cancelled(self.run_inner())
+            .await
+            .unwrap_or(Ok(()))
+    }
+
+    async fn run_inner(&mut self) -> anyhow::Result<()> {
+        loop {
+            enum Event {
+                Round(Round),
+                Block(message::Block),
+            }
+            match select! {
+                Some(round) = self.rx_round.recv() => Event::Round(round),
+                Some(block) = self.rx_block.recv() => Event::Block(block),
+                else => break,
+            } {
+                Event::Round(round) => {
+                    assert!(round > self.round);
+                    self.round = round;
+                    self.proposed_blocks.retain(|&r, _| r >= round);
+                }
+                Event::Block(block) => {
+                    if block.round < self.round {
+                        continue;
+                    }
+                    let round_blocks = self.proposed_blocks.entry(block.round).or_default();
+                    if round_blocks.contains_key(&block.creator_index) {
+                        warn!(
+                            "[{}] duplicate block for round {} from {}",
+                            self.node_index, block.round, block.creator_index
+                        );
+                        continue;
+                    }
+                    let block_hash = Block::from_network(&block).hash();
+                    round_blocks.insert(block.creator_index, block_hash);
+                    let block_ok = message::BlockOk {
+                        hash: block_hash,
+                        round: block.round,
+                        creator_index: block.creator_index,
+                        validator_index: self.node_index,
+                        sig: vec![], // TODO
+                    };
+                    let _ = self
+                        .tx_message
+                        .send((
+                            SendTo::Node(block.creator_index),
+                            Message::BlockOk(block_ok),
+                        ))
+                        .await;
                 }
             }
         }
