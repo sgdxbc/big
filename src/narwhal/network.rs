@@ -1,8 +1,7 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::net::SocketAddr;
 
 use bincode::config::standard;
 use bytes::Bytes;
-use rocksdb::DB;
 use tokio::{
     sync::{
         mpsc::{Receiver, Sender, channel},
@@ -14,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::network::{Mesh, Network, NetworkId};
 
-use super::{NodeIndex, SendTo, StorageConfig, StorageOp, message::Message};
+use super::{Block, NarwhalConfig, NodeIndex, SendTo, message::Message};
 
 struct Incoming {
     rx_bytes: Receiver<(NetworkId, Vec<u8>)>,
@@ -41,7 +40,7 @@ impl Incoming {
 
 struct Outgoing {
     node_table: Vec<NetworkId>, // node index -> network id
-    node_indices: Vec<NodeIndex>,
+    node_index: NodeIndex,
 
     rx_message: Receiver<(SendTo, Message)>,
     tx_bytes: Sender<(NetworkId, Bytes)>,
@@ -50,13 +49,13 @@ struct Outgoing {
 impl Outgoing {
     fn new(
         node_table: Vec<NetworkId>,
-        node_indices: Vec<NodeIndex>,
+        node_index: NodeIndex,
         rx_message: Receiver<(SendTo, Message)>,
         tx_bytes: Sender<(NetworkId, Bytes)>,
     ) -> Self {
         Self {
             node_table,
-            node_indices,
+            node_index,
             rx_message,
             tx_bytes,
         }
@@ -70,11 +69,18 @@ impl Outgoing {
             match send_to {
                 SendTo::All => {
                     for (node_index, &network_id) in self.node_table.iter().enumerate() {
-                        if self.node_indices.contains(&(node_index as _)) {
+                        if node_index as NodeIndex == self.node_index {
                             continue;
                         }
                         let _ = self.tx_bytes.send((network_id, bytes.clone())).await;
                     }
+                }
+                SendTo::Node(node_index) => {
+                    assert_ne!(node_index, self.node_index);
+                    let _ = self
+                        .tx_bytes
+                        .send((self.node_table[node_index as usize], bytes))
+                        .await;
                 }
             }
         }
@@ -82,25 +88,26 @@ impl Outgoing {
     }
 }
 
-pub struct Storage {
+pub struct Narwhal {
     tx_mesh_established: oneshot::Sender<()>,
 
-    core: super::Storage,
+    core: super::Narwhal,
     incoming: Incoming,
     outgoing: Outgoing,
     network: Network,
     mesh: Mesh,
 }
 
-impl Storage {
+impl Narwhal {
     pub fn new(
-        config: StorageConfig,
-        node_indices: Vec<NodeIndex>,
-        db: Arc<DB>,
+        config: NarwhalConfig,
+        node_index: NodeIndex,
+        bias_bullshark_anchor: bool,
         node_table: Vec<NetworkId>,
         addrs: Vec<SocketAddr>,
         network_id: NetworkId,
-        rx_op: Receiver<StorageOp>,
+        rx_txn: Receiver<Bytes>,
+        tx_block: Sender<Block>,
         tx_mesh_established: oneshot::Sender<()>,
     ) -> Self {
         let (tx_incoming_message, rx_incoming_message) = channel(100);
@@ -109,18 +116,19 @@ impl Storage {
         let (tx_incoming_bytes, rx_incoming_bytes) = channel(100);
         let (tx_outgoing_bytes, rx_outgoing_bytes) = channel(100);
 
-        let core = super::Storage::new(
+        let core = super::Narwhal::new(
             config,
-            node_indices.clone(),
-            db,
-            rx_op,
+            node_index,
+            bias_bullshark_anchor,
+            rx_txn,
+            tx_block,
             rx_incoming_message,
             tx_outgoing_message,
         );
         let incoming = Incoming::new(rx_incoming_bytes, tx_incoming_message);
         let outgoing = Outgoing::new(
             node_table,
-            node_indices,
+            node_index,
             rx_outgoing_message,
             tx_outgoing_bytes,
         );

@@ -19,6 +19,8 @@ use tracing::warn;
 
 use self::message::Message;
 
+pub mod network;
+
 pub type Round = u64;
 pub type NodeIndex = u16;
 
@@ -668,5 +670,20 @@ pub mod message {
         pub round: Round,
         pub creator_index: NodeIndex,
         pub sigs: Vec<(NodeIndex, Vec<u8>)>,
+    }
+}
+
+mod parse {
+    use crate::parse::Extract;
+
+    use super::NarwhalConfig;
+
+    impl Extract for NarwhalConfig {
+        fn extract(configs: &crate::parse::Configs) -> anyhow::Result<Self> {
+            Ok(Self {
+                num_node: configs.get("narwhal.num-node")?,
+                num_faulty_node: configs.get("narwhal.num-faulty-node")?,
+            })
+        }
     }
 }
