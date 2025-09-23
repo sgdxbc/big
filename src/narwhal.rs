@@ -5,7 +5,10 @@ use bytes::Bytes;
 use sha2::{Digest as _, Sha256};
 use tokio::{
     select,
-    sync::mpsc::{Receiver, Sender, channel},
+    sync::{
+        mpsc::{Receiver, Sender, channel},
+        watch,
+    },
     try_join,
 };
 use tokio_util::sync::CancellationToken;
@@ -105,8 +108,11 @@ impl Narwhal {
         tx_message: Sender<(SendTo, Message)>,
     ) -> Self {
         let (tx_cert, rx_cert) = channel(100);
-        let (tx_proposed_block, rx_proposed_block) = channel(100);
-        let (tx_round, rx_round) = channel(100);
+        // Certify use this channel to keep track of the (most recent) proposed block so it only
+        // needs to work on single block
+        // Validate use this channel to advance its round (in order to ignore old blocks) and to
+        // issue loopback BlockOk to Certify
+        let (tx_proposed, rx_proposed) = watch::channel((0, BlockHash([0; 32])));
         let propose = Propose::new(
             config.clone(),
             node_index,
@@ -114,20 +120,25 @@ impl Narwhal {
             rx_txn,
             rx_cert,
             tx_message.clone(),
-            tx_proposed_block,
-            tx_round,
+            tx_proposed,
         );
         let (tx_block_ok, rx_block_ok) = channel(100);
-        let (tx_certified, rx_certified) = channel(100);
+        let (tx_cert, rx_cert) = channel(100);
         let certify = Certify::new(
             config.clone(),
             node_index,
-            rx_proposed_block,
+            rx_proposed.clone(),
             rx_block_ok,
-            tx_certified,
+            tx_cert.clone(),
         );
         let (tx_received_block, rx_received_block) = channel(100);
-        let validate = Validate::new(node_index, rx_round, rx_received_block, tx_message.clone());
+        let validate = Validate::new(
+            node_index,
+            rx_received_block,
+            rx_proposed,
+            tx_message.clone(),
+            tx_block_ok.clone(),
+        );
         Self {
             config,
             node_index,
@@ -172,8 +183,7 @@ struct Propose {
     rx_txn: Receiver<Bytes>,
     rx_cert: Receiver<message::Cert>,
     tx_message: Sender<(SendTo, Message)>,
-    tx_proposed: Sender<(Round, BlockHash)>,
-    tx_round: Sender<Round>,
+    tx_proposed: watch::Sender<(Round, BlockHash)>,
 
     round: Round,
     txn_pool: Vec<Bytes>,
@@ -188,8 +198,7 @@ impl Propose {
         rx_txn: Receiver<Bytes>,
         rx_cert: Receiver<message::Cert>,
         tx_message: Sender<(SendTo, Message)>,
-        tx_proposed: Sender<(Round, BlockHash)>,
-        tx_round: Sender<Round>,
+        tx_proposed: watch::Sender<(Round, BlockHash)>,
     ) -> Self {
         Self {
             config,
@@ -199,7 +208,6 @@ impl Propose {
             rx_cert,
             tx_message,
             tx_proposed,
-            tx_round,
             round: 0,
             txn_pool: Default::default(),
             certs: Default::default(),
@@ -230,7 +238,7 @@ impl Propose {
                 txns: self.txn_pool.drain(..).map(Into::into).collect(),
             };
             let block_hash = Block::from_network(&block).hash();
-            let _ = self.tx_proposed.send((self.round, block_hash)).await;
+            let _ = self.tx_proposed.send((self.round, block_hash));
             let _ = self
                 .tx_message
                 .send((SendTo::All, Message::Block(block)))
@@ -269,7 +277,6 @@ impl Propose {
                                 )
                             }
                             self.round = cert_round + 1;
-                            let _ = self.tx_round.send(self.round).await;
                             self.certs.retain(|&r, _| r >= cert_round);
                             continue 'outer;
                         }
@@ -285,9 +292,9 @@ struct Certify {
     config: NarwhalConfig,
     node_index: NodeIndex,
 
-    rx_proposed: Receiver<(Round, BlockHash)>,
+    rx_proposed: watch::Receiver<(Round, BlockHash)>,
     rx_block_ok: Receiver<message::BlockOk>,
-    tx_certified: Sender<(BlockHash, message::Cert)>,
+    tx_cert: Sender<message::Cert>,
 
     certifying: Option<CertifyingState>,
 }
@@ -302,16 +309,16 @@ impl Certify {
     fn new(
         config: NarwhalConfig,
         node_index: NodeIndex,
-        rx_proposed: Receiver<(Round, BlockHash)>,
+        rx_proposed: watch::Receiver<(Round, BlockHash)>,
         rx_block_ok: Receiver<message::BlockOk>,
-        tx_certified: Sender<(BlockHash, message::Cert)>,
+        tx_cert: Sender<message::Cert>,
     ) -> Self {
         Self {
             config,
             node_index,
             rx_proposed,
             rx_block_ok,
-            tx_certified,
+            tx_cert,
             certifying: None,
         }
     }
@@ -326,15 +333,15 @@ impl Certify {
     async fn run_inner(&mut self) -> anyhow::Result<()> {
         loop {
             enum Event {
-                Block((Round, BlockHash)),
+                Proposed((Round, BlockHash)),
                 BlockOk(message::BlockOk),
             }
             match select! {
-                Some(block) = self.rx_proposed.recv() => Event::Block(block),
+                Ok(()) = self.rx_proposed.changed() => Event::Proposed(*self.rx_proposed.borrow_and_update()),
                 Some(block_ok) = self.rx_block_ok.recv() => Event::BlockOk(block_ok),
                 else => break,
             } {
-                Event::Block((round, block_hash)) => {
+                Event::Proposed((round, block_hash)) => {
                     let replaced = self.certifying.replace(CertifyingState {
                         round,
                         block_hash,
@@ -373,7 +380,7 @@ impl Certify {
                             block_hash: certifying.block_hash,
                             sigs: certifying.sigs.into_iter().collect(),
                         };
-                        let _ = self.tx_certified.send((certifying.block_hash, cert)).await;
+                        let _ = self.tx_cert.send(cert).await;
                     }
                 }
             }
@@ -385,9 +392,10 @@ impl Certify {
 struct Validate {
     node_index: NodeIndex,
 
-    rx_round: Receiver<Round>,
     rx_block: Receiver<message::Block>,
+    rx_proposed: watch::Receiver<(Round, BlockHash)>,
     tx_message: Sender<(SendTo, Message)>,
+    tx_loopback_block_ok: Sender<message::BlockOk>,
 
     round: Round,
     proposed_blocks: HashMap<Round, HashMap<NodeIndex, BlockHash>>,
@@ -396,15 +404,17 @@ struct Validate {
 impl Validate {
     fn new(
         node_index: NodeIndex,
-        rx_round: Receiver<Round>,
         rx_block: Receiver<message::Block>,
+        rx_proposed: watch::Receiver<(Round, BlockHash)>,
         tx_message: Sender<(SendTo, Message)>,
+        tx_loopback_block_ok: Sender<message::BlockOk>,
     ) -> Self {
         Self {
             node_index,
-            rx_round,
             rx_block,
+            rx_proposed,
             tx_message,
+            tx_loopback_block_ok,
             round: 0,
             proposed_blocks: Default::default(),
         }
@@ -420,23 +430,32 @@ impl Validate {
     async fn run_inner(&mut self) -> anyhow::Result<()> {
         loop {
             enum Event {
-                Round(Round),
+                Proposed((Round, BlockHash)),
                 Block(message::Block),
             }
             match select! {
-                Some(round) = self.rx_round.recv() => Event::Round(round),
+                Ok(())= self.rx_proposed.changed() => Event::Proposed(*self.rx_proposed.borrow_and_update()),
                 Some(block) = self.rx_block.recv() => Event::Block(block),
                 else => break,
             } {
-                Event::Round(round) => {
+                Event::Proposed((round, block_hash)) => {
                     assert!(round > self.round);
                     self.round = round;
                     self.proposed_blocks.retain(|&r, _| r >= round);
+                    let block_ok = message::BlockOk {
+                        hash: block_hash,
+                        round,
+                        creator_index: self.node_index,
+                        validator_index: self.node_index,
+                        sig: vec![], // TODO
+                    };
+                    let _ = self.tx_loopback_block_ok.send(block_ok).await;
                 }
                 Event::Block(block) => {
                     if block.round < self.round {
                         continue;
                     }
+                    // TODO verify block
                     let round_blocks = self.proposed_blocks.entry(block.round).or_default();
                     if round_blocks.contains_key(&block.creator_index) {
                         warn!(
@@ -480,7 +499,7 @@ pub mod message {
         Cert(Cert),
     }
 
-    #[derive(Debug, Encode, Decode)]
+    #[derive(Debug, Clone, Encode, Decode)]
     pub struct Block {
         pub round: Round,
         pub creator_index: NodeIndex,
@@ -497,7 +516,7 @@ pub mod message {
         pub sig: Vec<u8>, // TODO
     }
 
-    #[derive(Debug, Encode, Decode)]
+    #[derive(Debug, Clone, Encode, Decode)]
     pub struct Cert {
         pub block_hash: BlockHash,
         pub round: Round,
