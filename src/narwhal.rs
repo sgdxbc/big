@@ -1,4 +1,7 @@
-use std::{collections::HashMap, fmt::Debug};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Debug,
+};
 
 use bincode::{Decode, Encode};
 use bytes::Bytes;
@@ -44,11 +47,12 @@ pub struct Narwhal {
     config: NarwhalConfig,
     node_index: NodeIndex,
 
-    tx_block: Sender<Block>,
     rx_message: Receiver<Message>,
-    tx_message: Sender<(SendTo, Message)>,
 
     workers: Option<Workers>,
+    tx_received_block: Sender<message::Block>,
+    tx_received_cert: Sender<message::Cert>,
+    tx_certified: Sender<BlockHash>,
 }
 
 pub enum SendTo {
@@ -60,6 +64,7 @@ struct Workers {
     propose: Propose,
     certify: Certify,
     validate: Validate,
+    dag: Dag,
 }
 
 pub struct Block {
@@ -113,6 +118,7 @@ impl Narwhal {
         // Validate use this channel to advance its round (in order to ignore old blocks) and to
         // issue loopback BlockOk to Certify
         let (tx_proposed, rx_proposed) = watch::channel((0, BlockHash([0; 32])));
+        let (tx_certifying_block, rx_certifying_block) = channel(100);
         let propose = Propose::new(
             config.clone(),
             node_index,
@@ -121,9 +127,9 @@ impl Narwhal {
             rx_cert,
             tx_message.clone(),
             tx_proposed,
+            tx_certifying_block.clone(),
         );
         let (tx_block_ok, rx_block_ok) = channel(100);
-        let (tx_cert, rx_cert) = channel(100);
         let certify = Certify::new(
             config.clone(),
             node_index,
@@ -136,20 +142,25 @@ impl Narwhal {
             node_index,
             rx_received_block,
             rx_proposed,
-            tx_message.clone(),
+            tx_message,
             tx_block_ok.clone(),
+            tx_certifying_block,
         );
+        let (tx_certified, rx_certified) = channel(100);
+        let dag = Dag::new(rx_certifying_block, rx_certified, tx_block);
         Self {
             config,
             node_index,
-            tx_block,
             rx_message,
-            tx_message,
             workers: Some(Workers {
                 propose,
                 certify,
                 validate,
+                dag,
             }),
+            tx_received_block,
+            tx_received_cert: tx_cert,
+            tx_certified,
         }
     }
 
@@ -166,6 +177,7 @@ impl Narwhal {
             workers.propose.run(cancel.clone()),
             workers.certify.run(cancel.clone()),
             workers.validate.run(cancel.clone()),
+            workers.dag.run(cancel.clone()),
         )?;
         Ok(())
     }
@@ -184,6 +196,7 @@ struct Propose {
     rx_cert: Receiver<message::Cert>,
     tx_message: Sender<(SendTo, Message)>,
     tx_proposed: watch::Sender<(Round, BlockHash)>,
+    tx_block: Sender<Block>,
 
     round: Round,
     txn_pool: Vec<Bytes>,
@@ -199,6 +212,7 @@ impl Propose {
         rx_cert: Receiver<message::Cert>,
         tx_message: Sender<(SendTo, Message)>,
         tx_proposed: watch::Sender<(Round, BlockHash)>,
+        tx_block: Sender<Block>,
     ) -> Self {
         Self {
             config,
@@ -208,6 +222,7 @@ impl Propose {
             rx_cert,
             tx_message,
             tx_proposed,
+            tx_block,
             round: 0,
             txn_pool: Default::default(),
             certs: Default::default(),
@@ -237,7 +252,12 @@ impl Propose {
                 },
                 txns: self.txn_pool.drain(..).map(Into::into).collect(),
             };
-            let block_hash = Block::from_network(&block).hash();
+            let block_hash = {
+                let block = Block::from_network(&block);
+                let block_hash = block.hash();
+                let _ = self.tx_block.send(block).await;
+                block_hash
+            };
             let _ = self.tx_proposed.send((self.round, block_hash));
             let _ = self
                 .tx_message
@@ -396,6 +416,7 @@ struct Validate {
     rx_proposed: watch::Receiver<(Round, BlockHash)>,
     tx_message: Sender<(SendTo, Message)>,
     tx_loopback_block_ok: Sender<message::BlockOk>,
+    tx_block: Sender<Block>,
 
     round: Round,
     proposed_blocks: HashMap<Round, HashMap<NodeIndex, BlockHash>>,
@@ -408,6 +429,7 @@ impl Validate {
         rx_proposed: watch::Receiver<(Round, BlockHash)>,
         tx_message: Sender<(SendTo, Message)>,
         tx_loopback_block_ok: Sender<message::BlockOk>,
+        tx_block: Sender<Block>,
     ) -> Self {
         Self {
             node_index,
@@ -415,6 +437,7 @@ impl Validate {
             rx_proposed,
             tx_message,
             tx_loopback_block_ok,
+            tx_block,
             round: 0,
             proposed_blocks: Default::default(),
         }
@@ -464,7 +487,12 @@ impl Validate {
                         );
                         continue;
                     }
-                    let block_hash = Block::from_network(&block).hash();
+                    let block_hash = {
+                        let block = Block::from_network(&block);
+                        let block_hash = block.hash();
+                        let _ = self.tx_block.send(block).await;
+                        block_hash
+                    };
                     round_blocks.insert(block.creator_index, block_hash);
                     let block_ok = message::BlockOk {
                         hash: block_hash,
@@ -484,6 +512,92 @@ impl Validate {
             }
         }
         Ok(())
+    }
+}
+
+// better name?
+struct Dag {
+    rx_block: Receiver<Block>,
+    rx_certified: Receiver<BlockHash>,
+    tx_block: Sender<Block>,
+
+    certifying_blocks: HashMap<BlockHash, Block>,
+    reordering_blocks: HashMap<BlockHash, Vec<Block>>, // missing parent -> children
+    delivered: HashMap<Round, HashSet<BlockHash>>,
+}
+
+impl Dag {
+    fn new(
+        rx_block: Receiver<Block>,
+        rx_certified: Receiver<BlockHash>,
+        tx_block: Sender<Block>,
+    ) -> Self {
+        Self {
+            rx_block,
+            rx_certified,
+            tx_block,
+            certifying_blocks: Default::default(),
+            reordering_blocks: Default::default(),
+            delivered: Default::default(),
+        }
+    }
+
+    async fn run(mut self, cancel: CancellationToken) -> anyhow::Result<()> {
+        cancel
+            .run_until_cancelled(self.run_inner())
+            .await
+            .unwrap_or(Ok(()))
+    }
+
+    async fn run_inner(&mut self) -> anyhow::Result<()> {
+        loop {
+            enum Event {
+                Block(Block),
+                Certified(BlockHash),
+            }
+            match select! {
+                Some(block) = self.rx_block.recv() => Event::Block(block),
+                Some(block_hash) = self.rx_certified.recv() => Event::Certified(block_hash),
+                else => break,
+            } {
+                Event::Block(block) => {
+                    self.certifying_blocks.insert(block.hash(), block);
+                }
+                Event::Certified(block_hash) => {
+                    let Some(block) = self.certifying_blocks.remove(&block_hash) else {
+                        warn!("cert for unknown block {block_hash:?}");
+                        continue;
+                    };
+                    self.may_deliver(block).await
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn may_deliver(&mut self, block: Block) {
+        for &link in &block.links {
+            if !self.certifying_blocks.contains_key(&link)
+                && !self
+                    .delivered
+                    .get(&(block.round - 1))
+                    .is_some_and(|delivered| delivered.contains(&link))
+            {
+                self.reordering_blocks.entry(link).or_default().push(block);
+                return;
+            }
+        }
+        let block_hash = block.hash();
+        self.delivered
+            .entry(block.round)
+            .or_default()
+            .insert(block_hash);
+        let _ = self.tx_block.send(block).await;
+        if let Some(blocks) = self.reordering_blocks.remove(&block_hash) {
+            for block in blocks {
+                Box::pin(self.may_deliver(block)).await;
+            }
+        }
     }
 }
 
