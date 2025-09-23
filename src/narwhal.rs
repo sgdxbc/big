@@ -44,13 +44,11 @@ pub struct NarwhalConfig {
 }
 
 pub struct Narwhal {
-    config: NarwhalConfig,
-    node_index: NodeIndex,
-
     rx_message: Receiver<Message>,
 
     workers: Option<Workers>,
     tx_received_block: Sender<message::Block>,
+    tx_received_block_ok: Sender<message::BlockOk>,
     tx_received_cert: Sender<message::Cert>,
     tx_certified: Sender<BlockHash>,
 }
@@ -130,12 +128,15 @@ impl Narwhal {
             tx_certifying_block.clone(),
         );
         let (tx_block_ok, rx_block_ok) = channel(100);
+        let (tx_certified, rx_certified) = channel(100);
         let certify = Certify::new(
             config.clone(),
             node_index,
             rx_proposed.clone(),
             rx_block_ok,
             tx_cert.clone(),
+            tx_certified.clone(),
+            tx_message.clone(),
         );
         let (tx_received_block, rx_received_block) = channel(100);
         let validate = Validate::new(
@@ -146,11 +147,8 @@ impl Narwhal {
             tx_block_ok.clone(),
             tx_certifying_block,
         );
-        let (tx_certified, rx_certified) = channel(100);
-        let dag = Dag::new(rx_certifying_block, rx_certified, tx_block);
+        let dag = Dag::new(config.num_node, rx_certifying_block, rx_certified, tx_block);
         Self {
-            config,
-            node_index,
             rx_message,
             workers: Some(Workers {
                 propose,
@@ -159,6 +157,7 @@ impl Narwhal {
                 dag,
             }),
             tx_received_block,
+            tx_received_block_ok: tx_block_ok,
             tx_received_cert: tx_cert,
             tx_certified,
         }
@@ -183,6 +182,20 @@ impl Narwhal {
     }
 
     async fn run_inner(&mut self) -> anyhow::Result<()> {
+        while let Some(message) = self.rx_message.recv().await {
+            match message {
+                Message::Block(block) => {
+                    let _ = self.tx_received_block.send(block).await;
+                }
+                Message::BlockOk(block_ok) => {
+                    let _ = self.tx_received_block_ok.send(block_ok).await;
+                }
+                Message::Cert(cert) => {
+                    let _ = self.tx_certified.send(cert.block_hash).await;
+                    let _ = self.tx_received_cert.send(cert).await;
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -314,7 +327,9 @@ struct Certify {
 
     rx_proposed: watch::Receiver<(Round, BlockHash)>,
     rx_block_ok: Receiver<message::BlockOk>,
-    tx_cert: Sender<message::Cert>,
+    tx_loopback_cert: Sender<message::Cert>,
+    tx_certified: Sender<BlockHash>,
+    tx_message: Sender<(SendTo, Message)>,
 
     certifying: Option<CertifyingState>,
 }
@@ -332,13 +347,17 @@ impl Certify {
         rx_proposed: watch::Receiver<(Round, BlockHash)>,
         rx_block_ok: Receiver<message::BlockOk>,
         tx_cert: Sender<message::Cert>,
+        tx_certified: Sender<BlockHash>,
+        tx_message: Sender<(SendTo, Message)>,
     ) -> Self {
         Self {
             config,
             node_index,
             rx_proposed,
             rx_block_ok,
-            tx_cert,
+            tx_loopback_cert: tx_cert,
+            tx_certified,
+            tx_message,
             certifying: None,
         }
     }
@@ -400,7 +419,12 @@ impl Certify {
                             block_hash: certifying.block_hash,
                             sigs: certifying.sigs.into_iter().collect(),
                         };
-                        let _ = self.tx_cert.send(cert).await;
+                        let _ = self.tx_certified.send(certifying.block_hash).await;
+                        let _ = self.tx_loopback_cert.send(cert.clone()).await;
+                        let _ = self
+                            .tx_message
+                            .send((SendTo::All, Message::Cert(cert)))
+                            .await;
                     }
                 }
             }
@@ -517,6 +541,8 @@ impl Validate {
 
 // better name?
 struct Dag {
+    num_node: NodeIndex,
+
     rx_block: Receiver<Block>,
     rx_certified: Receiver<BlockHash>,
     tx_block: Sender<Block>,
@@ -528,11 +554,13 @@ struct Dag {
 
 impl Dag {
     fn new(
+        num_node: NodeIndex,
         rx_block: Receiver<Block>,
         rx_certified: Receiver<BlockHash>,
         tx_block: Sender<Block>,
     ) -> Self {
         Self {
+            num_node,
             rx_block,
             rx_certified,
             tx_block,
@@ -568,7 +596,8 @@ impl Dag {
                         warn!("cert for unknown block {block_hash:?}");
                         continue;
                     };
-                    self.may_deliver(block).await
+                    self.may_deliver(block).await;
+                    // TODO garbage collect
                 }
             }
         }
@@ -588,10 +617,13 @@ impl Dag {
             }
         }
         let block_hash = block.hash();
-        self.delivered
-            .entry(block.round)
-            .or_default()
-            .insert(block_hash);
+        let round_delivered = self.delivered.entry(block.round).or_default();
+        round_delivered.insert(block_hash);
+        // a weak garbage collection rule that only effective without faulty nodes
+        // just for evaluation purpose
+        if round_delivered.len() == self.num_node as usize && block.round > 0 {
+            self.delivered.remove(&(block.round - 1));
+        }
         let _ = self.tx_block.send(block).await;
         if let Some(blocks) = self.reordering_blocks.remove(&block_hash) {
             for block in blocks {
