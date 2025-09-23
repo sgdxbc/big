@@ -333,11 +333,12 @@ struct Certify {
     tx_certified: Sender<BlockHash>,
     tx_message: Sender<(SendTo, Message)>,
 
-    certifying: Option<CertifyingState>,
+    certifying_round: Round, // lowest round that is certifying i.e. not yet certified
+    certifying: HashMap<Round, CertifyingState>,
+    reorder_block_oks: HashMap<Round, Vec<message::BlockOk>>,
 }
 
 struct CertifyingState {
-    round: Round,
     block_hash: BlockHash,
     sigs: HashMap<NodeIndex, Vec<u8>>,
 }
@@ -360,7 +361,9 @@ impl Certify {
             tx_loopback_cert: tx_cert,
             tx_certified,
             tx_message,
-            certifying: None,
+            certifying_round: 0,
+            certifying: Default::default(),
+            reorder_block_oks: Default::default(),
         }
     }
 
@@ -383,55 +386,72 @@ impl Certify {
                 else => break,
             } {
                 Event::Proposed((round, block_hash)) => {
-                    let replaced = self.certifying.replace(CertifyingState {
+                    assert!(
+                        round >= self.certifying_round,
+                        "[{}] {round} < {}",
+                        self.node_index,
+                        self.certifying_round
+                    );
+                    let replaced = self.certifying.insert(
                         round,
-                        block_hash,
-                        sigs: Default::default(),
-                    });
-                    if let Some(replaced) = replaced {
-                        warn!(
-                            "block {} {:?} replaced before certified",
-                            replaced.round, replaced.block_hash
-                        )
+                        CertifyingState {
+                            block_hash,
+                            sigs: Default::default(),
+                        },
+                    );
+                    assert!(replaced.is_none());
+                    if let Some(block_oks) = self.reorder_block_oks.remove(&round) {
+                        for block_ok in block_oks {
+                            self.handle_block_ok(block_ok).await;
+                        }
                     }
                 }
-                Event::BlockOk(block_ok) => {
-                    let Some(state) = &mut self.certifying else {
-                        continue;
-                    };
-                    assert!(block_ok.round <= state.round);
-                    if block_ok.round != state.round {
-                        continue;
-                    }
-                    if block_ok.hash != state.block_hash
-                        || block_ok.creator_index != self.node_index
-                    {
-                        warn!("invalid BlockOk for round {}", block_ok.round);
-                        continue;
-                    }
-
-                    state.sigs.insert(block_ok.validator_index, block_ok.sig);
-                    if state.sigs.len()
-                        == (self.config.num_node - self.config.num_faulty_node) as usize
-                    {
-                        let certifying = self.certifying.take().unwrap();
-                        let cert = message::Cert {
-                            round: certifying.round,
-                            creator_index: self.node_index,
-                            block_hash: certifying.block_hash,
-                            sigs: certifying.sigs.into_iter().collect(),
-                        };
-                        let _ = self.tx_certified.send(certifying.block_hash).await;
-                        let _ = self.tx_loopback_cert.send(cert.clone()).await;
-                        let _ = self
-                            .tx_message
-                            .send((SendTo::All, Message::Cert(cert)))
-                            .await;
-                    }
-                }
+                Event::BlockOk(block_ok) => self.handle_block_ok(block_ok).await,
             }
         }
         Ok(())
+    }
+
+    async fn handle_block_ok(&mut self, block_ok: message::BlockOk) {
+        if block_ok.round < self.certifying_round {
+            return;
+        }
+        let Some(state) = self.certifying.get_mut(&block_ok.round) else {
+            self.reorder_block_oks
+                .entry(block_ok.round)
+                .or_default()
+                .push(block_ok);
+            return;
+        };
+        if block_ok.hash != state.block_hash || block_ok.creator_index != self.node_index {
+            warn!("invalid BlockOk for round {}", block_ok.round);
+            return;
+        }
+        state.sigs.insert(block_ok.validator_index, block_ok.sig);
+        // assert!(block_ok.round <= state.round);
+
+        while self
+            .certifying
+            .get(&self.certifying_round)
+            .is_some_and(|state| {
+                state.sigs.len() >= (self.config.num_node - self.config.num_faulty_node) as usize
+            })
+        {
+            let state = self.certifying.remove(&self.certifying_round).unwrap();
+            let cert = message::Cert {
+                round: self.certifying_round,
+                creator_index: self.node_index,
+                block_hash: state.block_hash,
+                sigs: state.sigs.into_iter().collect(),
+            };
+            let _ = self.tx_certified.send(state.block_hash).await;
+            let _ = self.tx_loopback_cert.send(cert.clone()).await;
+            let _ = self
+                .tx_message
+                .send((SendTo::All, Message::Cert(cert)))
+                .await;
+            self.certifying_round += 1
+        }
     }
 }
 
@@ -488,7 +508,7 @@ impl Validate {
                 else => break,
             } {
                 Event::Proposed((round, block_hash)) => {
-                    assert!(round > self.round);
+                    assert!(round == 0 || round > self.round);
                     self.round = round;
                     self.proposed_blocks.retain(|&r, _| r >= round);
                     let block_ok = message::BlockOk {
@@ -550,8 +570,9 @@ struct Dag {
     tx_block: Sender<Block>,
 
     certifying_blocks: HashMap<BlockHash, Block>,
-    reordering_blocks: HashMap<BlockHash, Vec<Block>>, // missing parent -> children
     delivered: HashMap<Round, HashSet<BlockHash>>,
+    reordering_blocks: HashMap<BlockHash, Vec<Block>>, // missing parent -> children
+    reordering_certified: HashSet<BlockHash>,
 }
 
 impl Dag {
@@ -567,8 +588,9 @@ impl Dag {
             rx_certified,
             tx_block,
             certifying_blocks: Default::default(),
-            reordering_blocks: Default::default(),
             delivered: Default::default(),
+            reordering_blocks: Default::default(),
+            reordering_certified: Default::default(),
         }
     }
 
@@ -591,11 +613,15 @@ impl Dag {
                 else => break,
             } {
                 Event::Block(block) => {
-                    self.certifying_blocks.insert(block.hash(), block);
+                    if self.reordering_certified.remove(&block.hash()) {
+                        self.may_deliver(block).await
+                    } else {
+                        self.certifying_blocks.insert(block.hash(), block);
+                    }
                 }
                 Event::Certified(block_hash) => {
                     let Some(block) = self.certifying_blocks.remove(&block_hash) else {
-                        warn!("cert for unknown block {block_hash:?}");
+                        self.reordering_certified.insert(block_hash);
                         continue;
                     };
                     self.may_deliver(block).await;

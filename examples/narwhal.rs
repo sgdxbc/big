@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use big::{narwhal::network::Narwhal, parse::Configs};
+use big::{logging::init_logging, narwhal::network::Narwhal, parse::Configs};
 use tokio::{
     sync::{mpsc::channel, oneshot},
     task::JoinSet,
@@ -12,6 +12,7 @@ use tracing::info;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    init_logging();
     let mut configs = Configs::new();
     configs.parse(
         "
