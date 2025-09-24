@@ -76,7 +76,8 @@ impl PlainSyncStorage {
     }
 }
 
-// this is pretty close to DBWorker + ActiveStateWorker + Storage::handle_op without sharding
+// this is pretty close to DBWorker + ActiveStateWorker + Storage::handle_op without sharding and
+// network stuff
 // maybe should be unified, but feels hard and overkill
 pub struct PlainPrefetchStorage {
     db: Arc<DB>,
@@ -114,11 +115,13 @@ impl PlainPrefetchStorage {
         cancel
             .run_until_cancelled(self.run_inner())
             .await
-            .unwrap_or(Ok(()))
+            .unwrap_or(Ok(()))?;
+        self.tasks.shutdown().await;
+        Ok(())
     }
 
     async fn run_inner(&mut self) -> anyhow::Result<()> {
-        self.db.put(b".version", 0u64.to_le_bytes())?;
+        self.db.put(b".version", "0")?;
         loop {
             enum Event<R> {
                 Op(StorageOp),
@@ -154,7 +157,7 @@ impl PlainPrefetchStorage {
                             }
                         }
                         let mut batch = WriteBatch::new();
-                        batch.put(b".version", self.version.to_le_bytes());
+                        batch.put(b".version", self.version.to_string());
                         for (key, value) in items {
                             let entry = ActiveEntry {
                                 version: self.version,
@@ -172,23 +175,20 @@ impl PlainPrefetchStorage {
                         let _ = tx_ok.send(());
                     }
                     StorageOp::Prefetch(storage_key, tx_ok) => {
+                        let _ = tx_ok.send(());
                         let db = self.db.clone();
-                        self.tasks.spawn(async move {
+                        self.tasks.spawn_blocking(move || {
                             let snapshot = db.snapshot();
                             let Some(version) = snapshot.get(b".version")? else {
                                 unimplemented!("no version found")
                             };
-                            let version = StateVersion::from_le_bytes(
-                                version.try_into().expect("valid version"),
-                            );
                             let value = snapshot.get(storage_key.0)?;
                             let active_entry = ActiveEntry {
-                                version,
+                                version: str::from_utf8(&version)?.parse()?,
                                 value: value.map(Into::into),
                             };
                             Ok((storage_key, active_entry))
                         });
-                        let _ = tx_ok.send(());
                     }
                     StorageOp::VoteArchive(..) => unimplemented!(),
                 },

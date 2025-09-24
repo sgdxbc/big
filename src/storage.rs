@@ -20,7 +20,7 @@ use tokio::{
     try_join,
 };
 use tokio_util::{future::FutureExt, sync::CancellationToken};
-use tracing::trace;
+use tracing::{debug, trace};
 
 use self::{
     archive::ArchiveWorker,
@@ -557,6 +557,7 @@ impl ActiveStateWorker {
                         assert!(entry.version >= self.purge_version);
                         let _ = tx_value.send(entry.value.clone());
                     } else {
+                        debug!("prefetch not complete in time for key {key:?}");
                         let replaced = self.fetch_tx_values.insert(key, tx_value);
                         anyhow::ensure!(replaced.is_none(), "concurrent fetch for the same key");
                     }

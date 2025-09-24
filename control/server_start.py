@@ -4,7 +4,8 @@ from common import *
 def tasks(hosts, role):
     tasks = []
     for index, host in enumerate(hosts):
-        tasks.append(Ssh(host, f"cd {deploy_dir} && ./big {role}{index}"))
+        # tasks.append(Ssh(host, f"cd {deploy_dir} && ./big {role}{index}"))
+        tasks.append(Ssh(host, f"cd {deploy_dir} && RUST_LOG=info,big::storage=debug ./big {role}{index}"))
         # tasks.append(Ssh(host, f"cd {deploy_dir} && RUST_BACKTRACE=1 ./big {role}{index}"))
     return tasks
 

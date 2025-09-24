@@ -69,7 +69,6 @@ async fn role_bench(configs: Configs, index: u16) -> anyhow::Result<()> {
 
     let temp_dir = TempDir::with_prefix("big-db.")?;
     let prefill_path = Path::new("/tmp/big-db-prefill");
-    info!("copying prefill db");
     let status = Command::new("cp")
         .arg("-rT")
         .arg(prefill_path)

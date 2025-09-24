@@ -93,9 +93,9 @@ impl DbWorker {
                 Event::Op(DbWorkerOp::Get(DbGet(key), tx_res)) => {
                     let shard_index = self.config.shard_of(&key);
                     let db = self.db.clone();
-                    self.tasks.spawn(async move {
+                    self.tasks.spawn_blocking(move || {
                         let snapshot = db.snapshot();
-                        let Some(version) = snapshot.get_pinned(".version")? else {
+                        let Some(version) = snapshot.get(".version")? else {
                             anyhow::bail!("missing version")
                         };
                         let value =
