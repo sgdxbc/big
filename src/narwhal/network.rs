@@ -102,7 +102,6 @@ impl Narwhal {
     pub fn new(
         config: NarwhalConfig,
         node_index: NodeIndex,
-        bias_bullshark_anchor: bool,
         node_table: Vec<NetworkId>,
         addrs: Vec<SocketAddr>,
         network_id: NetworkId,
@@ -119,7 +118,6 @@ impl Narwhal {
         let core = super::Narwhal::new(
             config,
             node_index,
-            bias_bullshark_anchor,
             rx_txn,
             tx_block,
             rx_incoming_message,

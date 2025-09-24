@@ -35,7 +35,6 @@ addrs   127.0.0.1:5003
         let narwhal = Narwhal::new(
             configs.extract()?,
             node_index,
-            true,
             (0..configs.get("narwhal.num-node")?).collect(),
             addrs.clone(),
             node_index as _,

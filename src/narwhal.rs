@@ -8,10 +8,7 @@ use bytes::Bytes;
 use sha2::{Digest as _, Sha256};
 use tokio::{
     select,
-    sync::{
-        mpsc::{Receiver, Sender, channel},
-        watch,
-    },
+    sync::mpsc::{Receiver, Sender, channel},
     try_join,
 };
 use tokio_util::sync::CancellationToken;
@@ -46,12 +43,21 @@ pub struct NarwhalConfig {
 }
 
 pub struct Narwhal {
+    config: NarwhalConfig,
+    node_index: NodeIndex,
+
+    rx_txn: Receiver<Bytes>,
     rx_message: Receiver<Message>,
+    tx_message: Sender<(SendTo, Message)>,
+
+    round: Round,
+    block_hash: BlockHash,
+    txn_pool: Vec<Bytes>,
+    block_oks: HashMap<NodeIndex, message::BlockOk>,
+    certs: HashMap<Round, HashMap<NodeIndex, message::Cert>>,
 
     workers: Option<Workers>,
-    tx_received_block: Sender<message::Block>,
-    tx_received_block_ok: Sender<message::BlockOk>,
-    tx_received_cert: Sender<message::Cert>,
+    tx_certifying_block: Sender<Block>,
     tx_certified: Sender<BlockHash>,
 }
 
@@ -61,12 +67,10 @@ pub enum SendTo {
 }
 
 struct Workers {
-    propose: Propose,
-    certify: Certify,
-    validate: Validate,
     dag: Dag,
 }
 
+#[derive(Debug, Clone)]
 pub struct Block {
     pub round: Round,
     pub node_index: NodeIndex,
@@ -106,61 +110,27 @@ impl Narwhal {
     pub fn new(
         config: NarwhalConfig,
         node_index: NodeIndex,
-        bias_bullshark_anchor: bool,
         rx_txn: Receiver<Bytes>,
         tx_block: Sender<Block>,
         rx_message: Receiver<Message>,
         tx_message: Sender<(SendTo, Message)>,
     ) -> Self {
-        let (tx_cert, rx_cert) = channel(100);
-        // Certify use this channel to keep track of the (most recent) proposed block so it only
-        // needs to work on single block
-        // Validate use this channel to advance its round (in order to ignore old blocks) and to
-        // issue loopback BlockOk to Certify
-        let (tx_proposed, rx_proposed) = watch::channel((0, BlockHash([0; 32])));
         let (tx_certifying_block, rx_certifying_block) = channel(100);
-        let propose = Propose::new(
-            config.clone(),
-            node_index,
-            bias_bullshark_anchor,
-            rx_txn,
-            rx_cert,
-            tx_message.clone(),
-            tx_proposed,
-            tx_certifying_block.clone(),
-        );
-        let (tx_block_ok, rx_block_ok) = channel(100);
         let (tx_certified, rx_certified) = channel(100);
-        let certify = Certify::new(
-            config.clone(),
-            node_index,
-            rx_proposed.clone(),
-            rx_block_ok,
-            tx_cert.clone(),
-            tx_certified.clone(),
-            tx_message.clone(),
-        );
-        let (tx_received_block, rx_received_block) = channel(100);
-        let validate = Validate::new(
-            node_index,
-            rx_received_block,
-            rx_proposed,
-            tx_message,
-            tx_block_ok.clone(),
-            tx_certifying_block,
-        );
         let dag = Dag::new(config.num_node, rx_certifying_block, rx_certified, tx_block);
         Self {
+            config,
+            node_index,
+            rx_txn,
             rx_message,
-            workers: Some(Workers {
-                propose,
-                certify,
-                validate,
-                dag,
-            }),
-            tx_received_block,
-            tx_received_block_ok: tx_block_ok,
-            tx_received_cert: tx_cert,
+            tx_message,
+            round: 0,
+            block_hash: BlockHash([0; 32]), // will soon be replaced after proposing
+            txn_pool: Default::default(),
+            block_oks: Default::default(),
+            certs: Default::default(),
+            workers: Some(Workers { dag }),
+            tx_certifying_block,
             tx_certified,
         }
     }
@@ -173,391 +143,142 @@ impl Narwhal {
                 .await
                 .unwrap_or(Ok(()))
         };
-        try_join!(
-            task,
-            workers.propose.run(cancel.clone()),
-            workers.certify.run(cancel.clone()),
-            workers.validate.run(cancel.clone()),
-            workers.dag.run(cancel.clone()),
-        )?;
+        try_join!(task, workers.dag.run(cancel.clone()),)?;
         Ok(())
     }
 
     async fn run_inner(&mut self) -> anyhow::Result<()> {
-        while let Some(message) = self.rx_message.recv().await {
-            match message {
-                Message::Block(block) => {
-                    let _ = self.tx_received_block.send(block).await;
-                }
-                Message::BlockOk(block_ok) => {
-                    let _ = self.tx_received_block_ok.send(block_ok).await;
-                }
-                Message::Cert(cert) => {
-                    let _ = self.tx_certified.send(cert.block_hash).await;
-                    let _ = self.tx_received_cert.send(cert).await;
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-struct Propose {
-    config: NarwhalConfig,
-    node_index: NodeIndex,
-    bias_bullshark_anchor: bool,
-
-    rx_txn: Receiver<Bytes>,
-    rx_cert: Receiver<message::Cert>,
-    tx_message: Sender<(SendTo, Message)>,
-    tx_proposed: watch::Sender<(Round, BlockHash)>,
-    tx_block: Sender<Block>,
-
-    round: Round,
-    txn_pool: Vec<Bytes>,
-    certs: HashMap<Round, HashMap<NodeIndex, message::Cert>>,
-}
-
-impl Propose {
-    fn new(
-        config: NarwhalConfig,
-        node_index: NodeIndex,
-        bias_bullshark_anchor: bool,
-        rx_txn: Receiver<Bytes>,
-        rx_cert: Receiver<message::Cert>,
-        tx_message: Sender<(SendTo, Message)>,
-        tx_proposed: watch::Sender<(Round, BlockHash)>,
-        tx_block: Sender<Block>,
-    ) -> Self {
-        Self {
-            config,
-            node_index,
-            bias_bullshark_anchor,
-            rx_txn,
-            rx_cert,
-            tx_message,
-            tx_proposed,
-            tx_block,
-            round: 0,
-            txn_pool: Default::default(),
-            certs: Default::default(),
-        }
-    }
-
-    async fn run(mut self, cancel: CancellationToken) -> anyhow::Result<()> {
-        cancel
-            .run_until_cancelled(self.run_inner())
-            .await
-            .unwrap_or(Ok(()))
-    }
-
-    async fn run_inner(&mut self) -> anyhow::Result<()> {
-        'outer: loop {
-            let block = message::Block {
-                round: self.round,
-                creator_index: self.node_index,
-                certs: if self.round == 0 {
-                    Default::default()
-                } else {
-                    self.certs
-                        .remove(&(self.round - 1))
-                        .unwrap()
-                        .into_values()
-                        .collect()
-                },
-                txns: self.txn_pool.drain(..).map(Into::into).collect(),
-            };
-            let block_hash = {
-                let block = Block::from_network(&block);
-                let block_hash = block.hash();
-                let _ = self.tx_block.send(block).await;
-                block_hash
-            };
-            let _ = self.tx_proposed.send((self.round, block_hash));
-            let _ = self
-                .tx_message
-                .send((SendTo::All, Message::Block(block)))
-                .await;
-            loop {
-                enum Event {
-                    Txn(Bytes),
-                    Cert(message::Cert),
-                }
-                match select! {
-                    Some(txn) = self.rx_txn.recv() => Event::Txn(txn),
-                    Some(cert) = self.rx_cert.recv() => Event::Cert(cert),
-                    else => break 'outer,
-                } {
-                    Event::Txn(txn) => self.txn_pool.push(txn),
-                    Event::Cert(cert) => {
-                        if cert.round < self.round {
-                            continue;
-                        }
-                        let cert_round = cert.round;
-                        let round_certs = self.certs.entry(cert_round).or_default();
-                        round_certs.insert(cert.creator_index, cert);
-                        if round_certs.len()
-                            >= (self.config.num_node - self.config.num_faulty_node) as usize
-                            && (!self.bias_bullshark_anchor
-                                || round_certs.contains_key(
-                                    &((cert_round % self.config.num_node as Round) as NodeIndex),
-                                ))
-                        {
-                            if self.round != cert_round {
-                                warn!(
-                                    "[{}] skip round {} -> {}",
-                                    self.node_index,
-                                    self.round,
-                                    cert_round + 1
-                                )
-                            }
-                            self.round = cert_round + 1;
-                            self.certs.retain(|&r, _| r >= cert_round);
-                            continue 'outer;
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-struct Certify {
-    config: NarwhalConfig,
-    node_index: NodeIndex,
-
-    rx_proposed: watch::Receiver<(Round, BlockHash)>,
-    rx_block_ok: Receiver<message::BlockOk>,
-    tx_loopback_cert: Sender<message::Cert>,
-    tx_certified: Sender<BlockHash>,
-    tx_message: Sender<(SendTo, Message)>,
-
-    certifying_round: Round, // lowest round that is certifying i.e. not yet certified
-    certifying: HashMap<Round, CertifyingState>,
-    reorder_block_oks: HashMap<Round, Vec<message::BlockOk>>,
-}
-
-struct CertifyingState {
-    block_hash: BlockHash,
-    sigs: HashMap<NodeIndex, Vec<u8>>,
-}
-
-impl Certify {
-    fn new(
-        config: NarwhalConfig,
-        node_index: NodeIndex,
-        rx_proposed: watch::Receiver<(Round, BlockHash)>,
-        rx_block_ok: Receiver<message::BlockOk>,
-        tx_cert: Sender<message::Cert>,
-        tx_certified: Sender<BlockHash>,
-        tx_message: Sender<(SendTo, Message)>,
-    ) -> Self {
-        Self {
-            config,
-            node_index,
-            rx_proposed,
-            rx_block_ok,
-            tx_loopback_cert: tx_cert,
-            tx_certified,
-            tx_message,
-            certifying_round: 0,
-            certifying: Default::default(),
-            reorder_block_oks: Default::default(),
-        }
-    }
-
-    async fn run(mut self, cancel: CancellationToken) -> anyhow::Result<()> {
-        cancel
-            .run_until_cancelled(self.run_inner())
-            .await
-            .unwrap_or(Ok(()))
-    }
-
-    async fn run_inner(&mut self) -> anyhow::Result<()> {
+        self.propose().await;
         loop {
             enum Event {
-                Proposed((Round, BlockHash)),
-                BlockOk(message::BlockOk),
+                Txn(Bytes),
+                Message(Message),
             }
             match select! {
-                Ok(()) = self.rx_proposed.changed() => Event::Proposed(*self.rx_proposed.borrow_and_update()),
-                Some(block_ok) = self.rx_block_ok.recv() => Event::BlockOk(block_ok),
+                Some(txn) = self.rx_txn.recv() => Event::Txn(txn),
+                Some(message) = self.rx_message.recv() => Event::Message(message),
                 else => break,
             } {
-                Event::Proposed((round, block_hash)) => {
-                    assert!(
-                        round >= self.certifying_round,
-                        "[{}] {round} < {}",
-                        self.node_index,
-                        self.certifying_round
-                    );
-                    let replaced = self.certifying.insert(
-                        round,
-                        CertifyingState {
-                            block_hash,
-                            sigs: Default::default(),
-                        },
-                    );
-                    assert!(replaced.is_none());
-                    if let Some(block_oks) = self.reorder_block_oks.remove(&round) {
-                        for block_ok in block_oks {
-                            self.handle_block_ok(block_ok).await;
-                        }
-                    }
-                }
-                Event::BlockOk(block_ok) => self.handle_block_ok(block_ok).await,
+                Event::Txn(txn) => self.txn_pool.push(txn),
+                Event::Message(message) => self.handle_message(message).await,
             }
         }
         Ok(())
     }
 
-    async fn handle_block_ok(&mut self, block_ok: message::BlockOk) {
-        if block_ok.round < self.certifying_round {
+    async fn handle_message(&mut self, message: Message) {
+        match message {
+            Message::Block(network_block) => {
+                let block = Block::from_network(&network_block);
+                let _ = self.tx_certifying_block.send(block.clone()).await;
+                self.validate(block).await
+                // let _ = self.tx_received_block.send(block).await;
+            }
+            Message::BlockOk(block_ok) => {
+                assert!(block_ok.round <= self.round);
+                if block_ok.round == self.round {
+                    self.insert_block_ok(block_ok).await
+                }
+            }
+            Message::Cert(cert) => self.handle_cert(cert).await,
+        }
+    }
+
+    async fn handle_cert(&mut self, cert: message::Cert) {
+        let _ = self.tx_certified.send(cert.block_hash).await;
+        let cert_round = cert.round;
+        if cert_round < self.round {
             return;
         }
-        let Some(state) = self.certifying.get_mut(&block_ok.round) else {
-            self.reorder_block_oks
-                .entry(block_ok.round)
-                .or_default()
-                .push(block_ok);
-            return;
+        let round_certs = self.certs.entry(cert_round).or_default();
+        round_certs.insert(cert.creator_index, cert);
+        if round_certs.len() >= (self.config.num_node - self.config.num_faulty_node) as usize
+        // TODO may need to restrict DAG shape
+        {
+            self.round = cert_round + 1;
+            self.certs.retain(|&r, _| r >= cert_round);
+            self.propose().await
+        }
+    }
+
+    async fn propose(&mut self) {
+        let certs = if self.round == 0 {
+            Default::default()
+        } else {
+            self.certs.remove(&(self.round - 1)).unwrap()
         };
-        if block_ok.hash != state.block_hash || block_ok.creator_index != self.node_index {
+        assert!(certs.iter().all(|(_, cert)| cert.round == self.round - 1));
+        let network_block = message::Block {
+            round: self.round,
+            creator_index: self.node_index,
+            certs: certs.into_values().collect(),
+            // TODO limit number of txns
+            txns: self.txn_pool.drain(..).map(Into::into).collect(),
+        };
+        let block = Block::from_network(&network_block);
+        let _ = self
+            .tx_message
+            .send((SendTo::All, Message::Block(network_block)))
+            .await;
+        self.block_hash = block.hash();
+        let _ = self.tx_certifying_block.send(block).await;
+        self.block_oks.clear()
+    }
+
+    async fn validate(&mut self, block: Block) {
+        if block.round > self.round {
+            // TODO
+            return;
+        }
+        if block.round != self.round {
+            return;
+        }
+        // TODO verify integrity and non-equvocation
+        let block_ok = message::BlockOk {
+            hash: block.hash(),
+            round: block.round,
+            creator_index: block.node_index,
+            validator_index: self.node_index,
+            sig: vec![], // TODO
+        };
+        if block.node_index == self.node_index {
+            self.insert_block_ok(block_ok).await
+        } else {
+            let _ = self
+                .tx_message
+                .send((SendTo::Node(block.node_index), Message::BlockOk(block_ok)))
+                .await;
+        }
+    }
+
+    async fn insert_block_ok(&mut self, block_ok: message::BlockOk) {
+        assert!(block_ok.round == self.round);
+        if self.block_oks.len() == (self.config.num_node - self.config.num_faulty_node) as usize {
+            return;
+        }
+        if block_ok.hash != self.block_hash || block_ok.creator_index != self.node_index {
             warn!("invalid BlockOk for round {}", block_ok.round);
             return;
         }
-        state.sigs.insert(block_ok.validator_index, block_ok.sig);
-        // assert!(block_ok.round <= state.round);
-
-        while self
-            .certifying
-            .get(&self.certifying_round)
-            .is_some_and(|state| {
-                state.sigs.len() >= (self.config.num_node - self.config.num_faulty_node) as usize
-            })
-        {
-            let state = self.certifying.remove(&self.certifying_round).unwrap();
+        // TODO verify signature
+        self.block_oks.insert(block_ok.validator_index, block_ok);
+        if self.block_oks.len() == (self.config.num_node - self.config.num_faulty_node) as usize {
             let cert = message::Cert {
-                round: self.certifying_round,
+                round: self.round,
                 creator_index: self.node_index,
-                block_hash: state.block_hash,
-                sigs: state.sigs.into_iter().collect(),
+                block_hash: self.block_hash,
+                sigs: self
+                    .block_oks
+                    .iter()
+                    .map(|(&idx, ok)| (idx, ok.sig.clone()))
+                    .collect(),
             };
-            let _ = self.tx_certified.send(state.block_hash).await;
-            let _ = self.tx_loopback_cert.send(cert.clone()).await;
             let _ = self
                 .tx_message
-                .send((SendTo::All, Message::Cert(cert)))
+                .send((SendTo::All, Message::Cert(cert.clone())))
                 .await;
-            self.certifying_round += 1
+            self.handle_cert(cert).await
         }
-    }
-}
-
-struct Validate {
-    node_index: NodeIndex,
-
-    rx_block: Receiver<message::Block>,
-    rx_proposed: watch::Receiver<(Round, BlockHash)>,
-    tx_message: Sender<(SendTo, Message)>,
-    tx_loopback_block_ok: Sender<message::BlockOk>,
-    tx_block: Sender<Block>,
-
-    round: Round,
-    proposed_blocks: HashMap<Round, HashMap<NodeIndex, BlockHash>>,
-}
-
-impl Validate {
-    fn new(
-        node_index: NodeIndex,
-        rx_block: Receiver<message::Block>,
-        rx_proposed: watch::Receiver<(Round, BlockHash)>,
-        tx_message: Sender<(SendTo, Message)>,
-        tx_loopback_block_ok: Sender<message::BlockOk>,
-        tx_block: Sender<Block>,
-    ) -> Self {
-        Self {
-            node_index,
-            rx_block,
-            rx_proposed,
-            tx_message,
-            tx_loopback_block_ok,
-            tx_block,
-            round: 0,
-            proposed_blocks: Default::default(),
-        }
-    }
-
-    async fn run(mut self, cancel: CancellationToken) -> anyhow::Result<()> {
-        cancel
-            .run_until_cancelled(self.run_inner())
-            .await
-            .unwrap_or(Ok(()))
-    }
-
-    async fn run_inner(&mut self) -> anyhow::Result<()> {
-        loop {
-            enum Event {
-                Proposed((Round, BlockHash)),
-                Block(message::Block),
-            }
-            match select! {
-                Ok(())= self.rx_proposed.changed() => Event::Proposed(*self.rx_proposed.borrow_and_update()),
-                Some(block) = self.rx_block.recv() => Event::Block(block),
-                else => break,
-            } {
-                Event::Proposed((round, block_hash)) => {
-                    assert!(round == 0 || round > self.round);
-                    self.round = round;
-                    self.proposed_blocks.retain(|&r, _| r >= round);
-                    let block_ok = message::BlockOk {
-                        hash: block_hash,
-                        round,
-                        creator_index: self.node_index,
-                        validator_index: self.node_index,
-                        sig: vec![], // TODO
-                    };
-                    let _ = self.tx_loopback_block_ok.send(block_ok).await;
-                }
-                Event::Block(block) => {
-                    if block.round < self.round {
-                        continue;
-                    }
-                    // TODO verify block
-                    let round_blocks = self.proposed_blocks.entry(block.round).or_default();
-                    if round_blocks.contains_key(&block.creator_index) {
-                        warn!(
-                            "[{}] duplicate block for round {} from {}",
-                            self.node_index, block.round, block.creator_index
-                        );
-                        continue;
-                    }
-                    let block_hash = {
-                        let block = Block::from_network(&block);
-                        let block_hash = block.hash();
-                        let _ = self.tx_block.send(block).await;
-                        block_hash
-                    };
-                    round_blocks.insert(block.creator_index, block_hash);
-                    let block_ok = message::BlockOk {
-                        hash: block_hash,
-                        round: block.round,
-                        creator_index: block.creator_index,
-                        validator_index: self.node_index,
-                        sig: vec![], // TODO
-                    };
-                    let _ = self
-                        .tx_message
-                        .send((
-                            SendTo::Node(block.creator_index),
-                            Message::BlockOk(block_ok),
-                        ))
-                        .await;
-                }
-            }
-        }
-        Ok(())
     }
 }
 
