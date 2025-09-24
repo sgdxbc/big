@@ -53,6 +53,7 @@ async fn role_prefill(configs: Configs, index: u16) -> anyhow::Result<()> {
     options.increase_parallelism(std::thread::available_parallelism()?.get() as _);
     options.set_max_subcompactions(std::thread::available_parallelism()?.get() as _);
     let db = DB::open(&options, path)?;
+    db.put(".configs", configs.to_string())?;
     let items = Bench::prefill_items(configs.extract()?);
     if configs.get("big.plain-storage")? {
         PlainStorage::prefill(db, items).await
@@ -78,6 +79,27 @@ async fn role_bench(configs: Configs, index: u16) -> anyhow::Result<()> {
     anyhow::ensure!(status.success());
     info!("prefill done");
 
+    let mut options = Options::default();
+    // let (mut options, cf_descs) = Options::load_latest(
+    //     temp_dir.path(),
+    //     rocksdb::Env::new()?,
+    //     false,
+    //     rocksdb::Cache::new_lru_cache(512 << 20),
+    // )?;
+    options.enable_statistics();
+    options.increase_parallelism(std::thread::available_parallelism()?.get() as _);
+    // let mut block_based_options = BlockBasedOptions::default();
+    // block_based_options.set_block_cache(&Cache::new_lru_cache(6 << 30));
+    // options.set_block_based_table_factory(&block_based_options);
+    let db = Arc::new(DB::open(&options, temp_dir.path())?);
+    let prefill_configs = db.get_pinned(".configs")?;
+    if let Some(prefill_configs) = prefill_configs
+        && &*prefill_configs == configs.to_string().as_bytes()
+    {
+    } else {
+        anyhow::bail!("mismatched configs")
+    }
+
     let cancel = CancellationToken::new();
     let (tx_start, rx_start) = oneshot::channel();
     let timeout = {
@@ -90,16 +112,6 @@ async fn role_bench(configs: Configs, index: u16) -> anyhow::Result<()> {
         }
     };
 
-    let mut options = Options::default();
-    // let (mut options, cf_descs) = Options::load_latest(
-    //     temp_dir.path(),
-    //     rocksdb::Env::new()?,
-    //     false,
-    //     rocksdb::Cache::new_lru_cache(512 << 20),
-    // )?;
-    options.enable_statistics();
-    options.increase_parallelism(std::thread::available_parallelism()?.get() as _);
-    let db = Arc::new(DB::open(&options, temp_dir.path())?);
     if configs.get("big.plain-storage")? {
         // db = Arc::new(DB::open_cf_descriptors(
         //     &options,

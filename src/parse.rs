@@ -1,8 +1,8 @@
 //! https://github.com/sgdxbc/bft-kit/discussions/4
-use std::{collections::HashMap, str::FromStr};
+use std::{collections::BTreeMap, fmt::Display, str::FromStr};
 
 #[derive(Debug, Clone, Default)]
-pub struct Configs(HashMap<String, Vec<String>>);
+pub struct Configs(BTreeMap<String, Vec<String>>);
 
 impl Configs {
     pub fn new() -> Self {
@@ -60,5 +60,16 @@ pub trait Extract: Sized {
 impl Configs {
     pub fn extract<T: Extract>(&self) -> anyhow::Result<T> {
         T::extract(self)
+    }
+}
+
+impl Display for Configs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (key, values) in &self.0 {
+            for value in values {
+                writeln!(f, "{key} {value}")?
+            }
+        }
+        Ok(())
     }
 }
