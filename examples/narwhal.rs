@@ -44,20 +44,17 @@ addrs   127.0.0.1:5003
         );
         tasks.spawn(narwhal.run(cancel.clone()));
         tasks.spawn(async move {
-            loop {
+            while {
                 let mut num_interval_block = 0;
                 let interval = async {
                     while let Some(_block) = rx_block.recv().await {
                         num_interval_block += 1;
                     }
                 };
-                match timeout(Duration::from_secs(1), interval).await {
-                    Err(_) => {
-                        info!("[{node_index}] {num_interval_block} blocks/sec")
-                    }
-                    Ok(()) => break,
-                }
-            }
+                let result = timeout(Duration::from_secs(1), interval).await;
+                info!("[{node_index}] {num_interval_block} blocks/sec");
+                result.is_err()
+            } {}
             Ok(())
         });
     }

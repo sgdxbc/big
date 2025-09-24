@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt::Debug,
+    mem::take,
 };
 
 use bincode::{Decode, Encode};
@@ -12,7 +13,7 @@ use tokio::{
     try_join,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{debug, trace, warn};
 
 use self::message::Message;
 
@@ -51,7 +52,7 @@ pub struct Narwhal {
     tx_message: Sender<(SendTo, Message)>,
 
     round: Round,
-    block_hash: BlockHash,
+    block_hash: Option<BlockHash>, // None if proposal for current round has certified
     txn_pool: Vec<Bytes>,
     block_oks: HashMap<NodeIndex, message::BlockOk>,
     certs: HashMap<Round, HashMap<NodeIndex, message::Cert>>,
@@ -126,7 +127,7 @@ impl Narwhal {
             rx_message,
             tx_message,
             round: 0,
-            block_hash: BlockHash([0; 32]), // will soon be replaced after proposing
+            block_hash: None,
             txn_pool: Default::default(),
             block_oks: Default::default(),
             certs: Default::default(),
@@ -169,11 +170,12 @@ impl Narwhal {
     }
 
     async fn handle_message(&mut self, message: Message) {
+        trace!("[{}] {message:?}", self.node_index);
         match message {
             Message::Block(network_block) => {
                 let block = Block::from_network(&network_block);
                 let _ = self.tx_certifying_block.send(block.clone()).await;
-                self.validate(block).await
+                self.validate(&block).await
                 // let _ = self.tx_received_block.send(block).await;
             }
             Message::BlockOk(block_ok) => {
@@ -197,11 +199,19 @@ impl Narwhal {
         if round_certs.len() >= (self.config.num_node - self.config.num_faulty_node) as usize
         // TODO may need to restrict DAG shape
         {
+            if cert_round > self.round {
+                warn!(
+                    "fast-forwarding from round {} to {}",
+                    self.round,
+                    cert_round + 1
+                );
+            }
             self.round = cert_round + 1;
+            trace!("[{}] advanced to round {}", self.node_index, self.round);
             self.certs.retain(|&r, _| r >= cert_round);
             self.propose().await;
             self.reorder_validate.retain(|&r, _| r >= self.round);
-            if let Some(pending) = self.reorder_validate.remove(&cert_round) {
+            if let Some(pending) = self.reorder_validate.remove(&self.round) {
                 for (node_index, block_hash) in pending {
                     self.validate2(node_index, block_hash).await
                 }
@@ -210,6 +220,10 @@ impl Narwhal {
     }
 
     async fn propose(&mut self) {
+        if let Some(block_hash) = self.block_hash {
+            debug!("[{}] interrupted proposal {block_hash:?}", self.node_index);
+            self.block_oks.clear()
+        }
         let certs = if self.round == 0 {
             Default::default()
         } else {
@@ -228,13 +242,17 @@ impl Narwhal {
             .tx_message
             .send((SendTo::All, Message::Block(network_block)))
             .await;
-        self.block_hash = block.hash();
-        let _ = self.tx_certifying_block.send(block).await;
-        self.block_oks.clear()
+        self.block_hash = Some(block.hash());
+        let _ = self.tx_certifying_block.send(block.clone()).await;
+        self.validate(&block).await
     }
 
-    async fn validate(&mut self, block: Block) {
+    async fn validate(&mut self, block: &Block) {
         if block.round < self.round {
+            trace!(
+                "[{}] ignoring old block for round {} < {}",
+                self.node_index, block.round, self.round
+            );
             return;
         }
         // TODO verify integrity
@@ -270,24 +288,27 @@ impl Narwhal {
 
     async fn insert_block_ok(&mut self, block_ok: message::BlockOk) {
         assert!(block_ok.round == self.round);
-        if self.block_oks.len() == (self.config.num_node - self.config.num_faulty_node) as usize {
+        let Some(block_hash) = self.block_hash else {
             return;
-        }
-        if block_ok.hash != self.block_hash || block_ok.creator_index != self.node_index {
+        };
+        if block_ok.hash != block_hash || block_ok.creator_index != self.node_index {
             warn!("invalid BlockOk for round {}", block_ok.round);
             return;
         }
         // TODO verify signature
         self.block_oks.insert(block_ok.validator_index, block_ok);
         if self.block_oks.len() == (self.config.num_node - self.config.num_faulty_node) as usize {
+            trace!(
+                "[{}] block {:?} certified for round {}",
+                self.node_index, block_hash, self.round
+            );
             let cert = message::Cert {
                 round: self.round,
                 creator_index: self.node_index,
-                block_hash: self.block_hash,
-                sigs: self
-                    .block_oks
-                    .iter()
-                    .map(|(&idx, ok)| (idx, ok.sig.clone()))
+                block_hash: self.block_hash.take().unwrap(),
+                sigs: take(&mut self.block_oks)
+                    .into_iter()
+                    .map(|(node_index, block_ok)| (node_index, block_ok.sig))
                     .collect(),
             };
             let _ = self
@@ -372,11 +393,10 @@ impl Dag {
 
     async fn may_deliver(&mut self, block: Block) {
         for &link in &block.links {
-            if !self.certifying_blocks.contains_key(&link)
-                && !self
-                    .delivered
-                    .get(&(block.round - 1))
-                    .is_some_and(|delivered| delivered.contains(&link))
+            if !self
+                .delivered
+                .get(&(block.round - 1))
+                .is_some_and(|delivered| delivered.contains(&link))
             {
                 self.reordering_blocks.entry(link).or_default().push(block);
                 return;
