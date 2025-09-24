@@ -18,6 +18,7 @@ async fn main() -> anyhow::Result<()> {
         "
 narwhal.num-node        4
 narwhal.num-faulty-node 1
+narwhal.garbage-collection-depth 10
 
 addrs   127.0.0.1:5000
 addrs   127.0.0.1:5001

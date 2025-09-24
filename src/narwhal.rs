@@ -41,6 +41,16 @@ impl Debug for BlockHash {
 pub struct NarwhalConfig {
     num_node: NodeIndex,
     num_faulty_node: NodeIndex,
+    // we adopt a simplified garbage collection rule of the Bullshark paper
+    // when the leader (anchor) is delivered at round r, garbage collect up to round
+    // r - garbage_collection_depth
+    garbage_collection_depth: Option<Round>,
+}
+
+impl NarwhalConfig {
+    fn is_bullshark_leader(&self, node_index: NodeIndex, round: Round) -> bool {
+        round % 2 == 0 && node_index == (round / 2 % self.num_node as Round) as NodeIndex
+    }
 }
 
 pub struct Narwhal {
@@ -119,7 +129,7 @@ impl Narwhal {
     ) -> Self {
         let (tx_certifying_block, rx_certifying_block) = channel(100);
         let (tx_certified, rx_certified) = channel(100);
-        let dag = Dag::new(config.num_node, rx_certifying_block, rx_certified, tx_block);
+        let dag = Dag::new(config.clone(), rx_certifying_block, rx_certified, tx_block);
         Self {
             config,
             node_index,
@@ -322,34 +332,34 @@ impl Narwhal {
 
 // better name?
 struct Dag {
-    num_node: NodeIndex,
+    config: NarwhalConfig,
 
-    rx_block: Receiver<Block>,
+    rx_certifying: Receiver<Block>,
     rx_certified: Receiver<BlockHash>,
     tx_block: Sender<Block>,
 
     certifying_blocks: HashMap<BlockHash, Block>,
     delivered: HashMap<Round, HashSet<BlockHash>>,
-    reordering_blocks: HashMap<BlockHash, Vec<Block>>, // missing parent -> children
-    reordering_certified: HashSet<BlockHash>,
+    reorder_blocks: HashMap<BlockHash, Vec<Block>>, // missing parent -> children
+    reorder_certified: HashSet<BlockHash>,
 }
 
 impl Dag {
     fn new(
-        num_node: NodeIndex,
-        rx_block: Receiver<Block>,
+        config: NarwhalConfig,
+        rx_certifying: Receiver<Block>,
         rx_certified: Receiver<BlockHash>,
         tx_block: Sender<Block>,
     ) -> Self {
         Self {
-            num_node,
-            rx_block,
+            config,
+            rx_certifying,
             rx_certified,
             tx_block,
             certifying_blocks: Default::default(),
             delivered: Default::default(),
-            reordering_blocks: Default::default(),
-            reordering_certified: Default::default(),
+            reorder_blocks: Default::default(),
+            reorder_certified: Default::default(),
         }
     }
 
@@ -357,34 +367,42 @@ impl Dag {
         cancel
             .run_until_cancelled(self.run_inner())
             .await
-            .unwrap_or(Ok(()))
+            .unwrap_or(Ok(()))?;
+        tracing::info!(
+            "certifying blocks = {}, delivered = {}, reorder_blocks = {}, reorder_certified = {}",
+            self.certifying_blocks.len(),
+            self.delivered.iter().map(|(_, s)| s.len()).sum::<usize>(),
+            self.reorder_blocks.len(),
+            self.reorder_certified.len(),
+        );
+        Ok(())
     }
 
     async fn run_inner(&mut self) -> anyhow::Result<()> {
         loop {
             enum Event {
-                Block(Block),
+                Certifying(Block),
                 Certified(BlockHash),
             }
             match select! {
-                Some(block) = self.rx_block.recv() => Event::Block(block),
+                Some(block) = self.rx_certifying.recv() => Event::Certifying(block),
                 Some(block_hash) = self.rx_certified.recv() => Event::Certified(block_hash),
                 else => break,
             } {
-                Event::Block(block) => {
-                    if self.reordering_certified.remove(&block.hash()) {
+                Event::Certifying(block) => {
+                    if self.reorder_certified.remove(&block.hash()) {
                         self.may_deliver(block).await
                     } else {
-                        self.certifying_blocks.insert(block.hash(), block);
+                        let block_hash = block.hash();
+                        self.certifying_blocks.insert(block_hash, block);
                     }
                 }
                 Event::Certified(block_hash) => {
                     let Some(block) = self.certifying_blocks.remove(&block_hash) else {
-                        self.reordering_certified.insert(block_hash);
+                        self.reorder_certified.insert(block_hash);
                         continue;
                     };
-                    self.may_deliver(block).await;
-                    // TODO garbage collect
+                    self.may_deliver(block).await
                 }
             }
         }
@@ -398,20 +416,30 @@ impl Dag {
                 .get(&(block.round - 1))
                 .is_some_and(|delivered| delivered.contains(&link))
             {
-                self.reordering_blocks.entry(link).or_default().push(block);
+                self.reorder_blocks.entry(link).or_default().push(block);
                 return;
             }
         }
+        // first perform bookkeeping that access block fields
         let block_hash = block.hash();
         let round_delivered = self.delivered.entry(block.round).or_default();
         round_delivered.insert(block_hash);
-        // a weak garbage collection rule that only effective without faulty nodes
-        // just for evaluation purpose
-        if round_delivered.len() == self.num_node as usize && block.round > 0 {
-            self.delivered.remove(&(block.round - 1));
+        if let Some(depth) = self.config.garbage_collection_depth
+            && block.round >= depth
+            && self
+                .config
+                .is_bullshark_leader(block.node_index, block.round)
+        {
+            let gc_round = block.round - depth;
+            self.delivered.retain(|&r, _| r > gc_round);
+            self.certifying_blocks.retain(|_, b| b.round > gc_round)
+            // we do not perform garbage collection in `reorder_blocks` and `reorder_certified`
+            // because the relevant missing blocks are _secured_ by a quorum certificate so they
+            // will eventually appear
         }
+        // then depart the block
         let _ = self.tx_block.send(block).await;
-        if let Some(blocks) = self.reordering_blocks.remove(&block_hash) {
+        if let Some(blocks) = self.reorder_blocks.remove(&block_hash) {
             for block in blocks {
                 Box::pin(self.may_deliver(block)).await;
             }
@@ -467,6 +495,7 @@ mod parse {
             Ok(Self {
                 num_node: configs.get("narwhal.num-node")?,
                 num_faulty_node: configs.get("narwhal.num-faulty-node")?,
+                garbage_collection_depth: configs.get_option("narwhal.garbage-collection-depth")?,
             })
         }
     }
