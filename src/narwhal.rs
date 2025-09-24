@@ -55,6 +55,7 @@ pub struct Narwhal {
     txn_pool: Vec<Bytes>,
     block_oks: HashMap<NodeIndex, message::BlockOk>,
     certs: HashMap<Round, HashMap<NodeIndex, message::Cert>>,
+    reorder_validate: HashMap<Round, Vec<(NodeIndex, BlockHash)>>,
 
     workers: Option<Workers>,
     tx_certifying_block: Sender<Block>,
@@ -129,6 +130,7 @@ impl Narwhal {
             txn_pool: Default::default(),
             block_oks: Default::default(),
             certs: Default::default(),
+            reorder_validate: Default::default(),
             workers: Some(Workers { dag }),
             tx_certifying_block,
             tx_certified,
@@ -197,7 +199,13 @@ impl Narwhal {
         {
             self.round = cert_round + 1;
             self.certs.retain(|&r, _| r >= cert_round);
-            self.propose().await
+            self.propose().await;
+            self.reorder_validate.retain(|&r, _| r >= self.round);
+            if let Some(pending) = self.reorder_validate.remove(&cert_round) {
+                for (node_index, block_hash) in pending {
+                    self.validate2(node_index, block_hash).await
+                }
+            }
         }
     }
 
@@ -226,27 +234,36 @@ impl Narwhal {
     }
 
     async fn validate(&mut self, block: Block) {
-        if block.round > self.round {
-            // TODO
+        if block.round < self.round {
             return;
         }
-        if block.round != self.round {
-            return;
+        // TODO verify integrity
+        let block_hash = block.hash();
+        if block.round == self.round {
+            self.validate2(block.node_index, block_hash).await
+        } else {
+            self.reorder_validate
+                .entry(block.round)
+                .or_default()
+                .push((block.node_index, block_hash))
         }
-        // TODO verify integrity and non-equvocation
+    }
+
+    async fn validate2(&mut self, node_index: NodeIndex, block_hash: BlockHash) {
+        // TODO verify non-equivocation
         let block_ok = message::BlockOk {
-            hash: block.hash(),
-            round: block.round,
-            creator_index: block.node_index,
+            hash: block_hash,
+            round: self.round,
+            creator_index: node_index,
             validator_index: self.node_index,
             sig: vec![], // TODO
         };
-        if block.node_index == self.node_index {
+        if node_index == self.node_index {
             self.insert_block_ok(block_ok).await
         } else {
             let _ = self
                 .tx_message
-                .send((SendTo::Node(block.node_index), Message::BlockOk(block_ok)))
+                .send((SendTo::Node(node_index), Message::BlockOk(block_ok)))
                 .await;
         }
     }
@@ -277,7 +294,7 @@ impl Narwhal {
                 .tx_message
                 .send((SendTo::All, Message::Cert(cert.clone())))
                 .await;
-            self.handle_cert(cert).await
+            Box::pin(self.handle_cert(cert)).await
         }
     }
 }
