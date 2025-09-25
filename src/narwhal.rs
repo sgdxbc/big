@@ -371,7 +371,7 @@ impl Dag {
         tracing::info!(
             "certifying blocks = {}, delivered = {}, reorder_blocks = {}, reorder_certified = {}",
             self.certifying_blocks.len(),
-            self.delivered.iter().map(|(_, s)| s.len()).sum::<usize>(),
+            self.delivered.values().map(|s| s.len()).sum::<usize>(),
             self.reorder_blocks.len(),
             self.reorder_certified.len(),
         );
