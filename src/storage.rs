@@ -11,7 +11,7 @@ use bytes::Bytes;
 use rand::{Rng, SeedableRng, rngs::StdRng, seq::IteratorRandom};
 use rocksdb::{DB, WriteBatch};
 use tokio::{
-    select, spawn,
+    select,
     sync::{
         mpsc::{Receiver, Sender, channel},
         oneshot,
@@ -19,12 +19,12 @@ use tokio::{
     task::JoinSet,
     try_join,
 };
-use tokio_util::{future::FutureExt, sync::CancellationToken};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace};
 
 use self::{
     archive::ArchiveWorker,
-    db::{DbGet, DbPut, DbPutRes, DbWorker, DbWorkerOp, VirtualDb},
+    db::{DbWorker, DbWorkerOp, VirtualDb},
     message::Message,
 };
 
@@ -68,9 +68,6 @@ pub enum StorageOp {
     // benchmark
     Bump(BumpUpdates, oneshot::Sender<()>),
 
-    // similar to Bump; only start measure latency after Prefetch is done
-    Prefetch(StorageKey, oneshot::Sender<()>),
-
     VoteArchive(NodeIndex, ArchiveRound),
 }
 
@@ -79,7 +76,6 @@ impl Debug for StorageOp {
         match self {
             StorageOp::Fetch(key, _) => write!(f, "Fetch({key:?})"),
             StorageOp::Bump(updates, _) => write!(f, "Bump(len={})", updates.len()),
-            StorageOp::Prefetch(key, _) => write!(f, "Prefetch({key:?})"),
             StorageOp::VoteArchive(node_index, round) => {
                 write!(f, "VoteArchive(node_index={node_index}, round={round})")
             }
@@ -285,143 +281,144 @@ impl Storage {
 
     async fn handle_op(&mut self, op: StorageOp) {
         trace!("{:?} version={} {op:?}", self.node_indices, self.version);
-        match op {
-            StorageOp::Prefetch(storage_key, tx_ok) => {
-                let shard_index = self.config.shard_of(&storage_key);
-                if self
-                    .hosting_shard_indices
-                    .contains(&self.config.shard_of(&storage_key))
-                {
-                    let (tx_res, rx_res) = oneshot::channel();
-                    let _ = self
-                        .tx_db_worker_op
-                        .send(DbWorkerOp::Get(DbGet(storage_key), tx_res))
-                        .await;
-                    let tx_active_state_op = self.tx_active_state_op.clone();
-                    let tx_message = if self
-                        .node_indices
-                        .contains(&self.config.primary_node_of(shard_index))
-                    {
-                        Some(self.tx_message.clone())
-                    } else {
-                        None
-                    };
-                    spawn(
-                        async move {
-                            let Ok(get_res) = rx_res.await else {
-                                return;
-                            };
-                            let entry = ActiveEntry {
-                                version: get_res.version,
-                                value: get_res.value.clone(),
-                            };
-                            let _ = tx_active_state_op
-                                .send(ActiveStateOp::Install(storage_key, entry))
-                                .await;
-                            if let Some(tx_message) = tx_message {
-                                let push_entry = message::PushEntry {
-                                    version: get_res.version,
-                                    key: storage_key,
-                                    value: get_res.value.map(Into::into),
-                                    proof: get_res.proof,
-                                };
-                                let _ = tx_message
-                                    .send((SendTo::All, Message::PushEntry(push_entry)))
-                                    .await;
-                            }
-                        }
-                        .with_cancellation_token_owned(self.cancel.clone()),
-                    );
-                }
-                let _ = tx_ok.send(());
-            }
-            StorageOp::Fetch(storage_key, tx_value) => {
-                let _ = self
-                    .tx_active_state_op
-                    .send(ActiveStateOp::Fetch(storage_key, tx_value))
-                    .await;
-            }
-            StorageOp::Bump(mut updates, tx_ok) => {
-                self.version += 1;
-                if self.version >= self.config.prefetch_offset {
-                    let _ = self
-                        .tx_active_state_op
-                        .send(ActiveStateOp::Purge(
-                            self.version - self.config.prefetch_offset,
-                        ))
-                        .await;
-                }
-                for (storage_key, value) in &updates {
-                    let active_entry = ActiveEntry {
-                        version: self.version,
-                        value: value.clone(),
-                    };
-                    let _ = self
-                        .tx_active_state_op
-                        .send(ActiveStateOp::Install(*storage_key, active_entry))
-                        .await;
-                }
+        todo!()
+        // match op {
+        //     StorageOp::Prefetch(storage_key, tx_ok) => {
+        //         let shard_index = self.config.shard_of(&storage_key);
+        //         if self
+        //             .hosting_shard_indices
+        //             .contains(&self.config.shard_of(&storage_key))
+        //         {
+        //             let (tx_res, rx_res) = oneshot::channel();
+        //             let _ = self
+        //                 .tx_db_worker_op
+        //                 .send(DbWorkerOp::Get(DbGet(storage_key), tx_res))
+        //                 .await;
+        //             let tx_active_state_op = self.tx_active_state_op.clone();
+        //             let tx_message = if self
+        //                 .node_indices
+        //                 .contains(&self.config.primary_node_of(shard_index))
+        //             {
+        //                 Some(self.tx_message.clone())
+        //             } else {
+        //                 None
+        //             };
+        //             spawn(
+        //                 async move {
+        //                     let Ok(get_res) = rx_res.await else {
+        //                         return;
+        //                     };
+        //                     let entry = ActiveEntry {
+        //                         version: get_res.version,
+        //                         value: get_res.value.clone(),
+        //                     };
+        //                     let _ = tx_active_state_op
+        //                         .send(ActiveStateOp::Install(storage_key, entry))
+        //                         .await;
+        //                     if let Some(tx_message) = tx_message {
+        //                         let push_entry = message::PushEntry {
+        //                             version: get_res.version,
+        //                             key: storage_key,
+        //                             value: get_res.value.map(Into::into),
+        //                             proof: get_res.proof,
+        //                         };
+        //                         let _ = tx_message
+        //                             .send((SendTo::All, Message::PushEntry(push_entry)))
+        //                             .await;
+        //                     }
+        //                 }
+        //                 .with_cancellation_token_owned(self.cancel.clone()),
+        //             );
+        //         }
+        //         let _ = tx_ok.send(());
+        //     }
+        //     StorageOp::Fetch(storage_key, tx_value) => {
+        //         let _ = self
+        //             .tx_active_state_op
+        //             .send(ActiveStateOp::Fetch(storage_key, tx_value))
+        //             .await;
+        //     }
+        //     StorageOp::Bump(mut updates, tx_ok) => {
+        //         self.version += 1;
+        //         if self.version >= self.config.prefetch_offset {
+        //             let _ = self
+        //                 .tx_active_state_op
+        //                 .send(ActiveStateOp::Purge(
+        //                     self.version - self.config.prefetch_offset,
+        //                 ))
+        //                 .await;
+        //         }
+        //         for (storage_key, value) in &updates {
+        //             let active_entry = ActiveEntry {
+        //                 version: self.version,
+        //                 value: value.clone(),
+        //             };
+        //             let _ = self
+        //                 .tx_active_state_op
+        //                 .send(ActiveStateOp::Install(*storage_key, active_entry))
+        //                 .await;
+        //         }
 
-                updates.retain(|(key, _)| {
-                    self.hosting_shard_indices
-                        .contains(&self.config.shard_of(key))
-                });
-                let put = DbPut {
-                    version: self.version,
-                    updates,
-                };
-                let (tx_res, rx_res) = oneshot::channel();
-                let _ = self
-                    .tx_db_worker_op
-                    .send(DbWorkerOp::Put(put, tx_res))
-                    .await;
-                let config = self.config.clone();
-                let node_indices = self.node_indices.clone();
-                let version = self.version;
-                let tx_message = self.tx_message.clone();
-                spawn(
-                    async move {
-                        let Ok(DbPutRes(mut shard_deltas)) = rx_res.await else {
-                            return;
-                        };
-                        shard_deltas.retain(|&shard_index, _| {
-                            node_indices.contains(&config.primary_node_of(shard_index))
-                        });
-                        if !shard_deltas.is_empty() {
-                            let push_update_info = message::PushUpdateInfo {
-                                version,
-                                shard_deltas,
-                            };
-                            let _ = tx_message
-                                .send((SendTo::All, Message::PushUpdateInfo(push_update_info)))
-                                .await;
-                        }
-                    }
-                    .with_cancellation_token_owned(self.cancel.clone()),
-                );
-                // the underlying worker guarantees to not start Get before finishing
-                // earlier `Put`s, so its safe to handle Prefetch (and issue Get) before
-                // Put is done i.e. rx_res is resolved
-                let _ = tx_ok.send(());
-            }
+        //         updates.retain(|(key, _)| {
+        //             self.hosting_shard_indices
+        //                 .contains(&self.config.shard_of(key))
+        //         });
+        //         let put = DbPut {
+        //             version: self.version,
+        //             updates,
+        //         };
+        //         let (tx_res, rx_res) = oneshot::channel();
+        //         let _ = self
+        //             .tx_db_worker_op
+        //             .send(DbWorkerOp::Put(put, tx_res))
+        //             .await;
+        //         let config = self.config.clone();
+        //         let node_indices = self.node_indices.clone();
+        //         let version = self.version;
+        //         let tx_message = self.tx_message.clone();
+        //         spawn(
+        //             async move {
+        //                 let Ok(DbPutRes(mut shard_deltas)) = rx_res.await else {
+        //                     return;
+        //                 };
+        //                 shard_deltas.retain(|&shard_index, _| {
+        //                     node_indices.contains(&config.primary_node_of(shard_index))
+        //                 });
+        //                 if !shard_deltas.is_empty() {
+        //                     let push_update_info = message::PushUpdateInfo {
+        //                         version,
+        //                         shard_deltas,
+        //                     };
+        //                     let _ = tx_message
+        //                         .send((SendTo::All, Message::PushUpdateInfo(push_update_info)))
+        //                         .await;
+        //                 }
+        //             }
+        //             .with_cancellation_token_owned(self.cancel.clone()),
+        //         );
+        //         // the underlying worker guarantees to not start Get before finishing
+        //         // earlier `Put`s, so its safe to handle Prefetch (and issue Get) before
+        //         // Put is done i.e. rx_res is resolved
+        //         let _ = tx_ok.send(());
+        //     }
 
-            StorageOp::VoteArchive(node_index, round) => {
-                let node_round = &mut self.archive_voted_rounds[node_index as usize];
-                if round > *node_round {
-                    *node_round = round;
-                    let mut voted_rounds = self.archive_voted_rounds.clone();
-                    voted_rounds.sort_unstable();
-                    let quorum_voted_round = voted_rounds[self.config.num_faulty_node as usize];
-                    if quorum_voted_round > self.archive_quorum_voted_round {
-                        self.archive_quorum_voted_round = quorum_voted_round;
-                        let _ = self
-                            .tx_db_worker_op
-                            .send(DbWorkerOp::Archive(quorum_voted_round))
-                            .await;
-                    }
-                }
-            }
-        }
+        //     StorageOp::VoteArchive(node_index, round) => {
+        //         let node_round = &mut self.archive_voted_rounds[node_index as usize];
+        //         if round > *node_round {
+        //             *node_round = round;
+        //             let mut voted_rounds = self.archive_voted_rounds.clone();
+        //             voted_rounds.sort_unstable();
+        //             let quorum_voted_round = voted_rounds[self.config.num_faulty_node as usize];
+        //             if quorum_voted_round > self.archive_quorum_voted_round {
+        //                 self.archive_quorum_voted_round = quorum_voted_round;
+        //                 let _ = self
+        //                     .tx_db_worker_op
+        //                     .send(DbWorkerOp::Archive(quorum_voted_round))
+        //                     .await;
+        //             }
+        //         }
+        //     }
+        // }
     }
 
     async fn handle_message(&mut self, message: Message) {

@@ -114,7 +114,6 @@ impl InMemory {
                     }
                     let _ = tx_ok.send(());
                 }
-                StorageOp::Prefetch(..) => {} // no-op
                 StorageOp::VoteArchive(..) => unimplemented!(),
             }
         }
@@ -156,7 +155,6 @@ impl Inline {
                     db.write(batch)?;
                     let _ = tx_ok.send(());
                 }
-                StorageOp::Prefetch(..) => {} // no-op
                 StorageOp::VoteArchive(..) => unimplemented!(),
             }
         }

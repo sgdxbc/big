@@ -10,10 +10,12 @@ use bytes::Bytes;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use rocksdb::DB;
 use tokio::{
+    spawn,
     sync::{
         mpsc::{Sender, channel},
         oneshot,
     },
+    task::JoinHandle,
     try_join,
 };
 use tokio_util::sync::CancellationToken;
@@ -39,13 +41,13 @@ pub struct Bench {
     tx_op: Sender<StorageOp>,
 
     rng: StdRng,
-    command_queue: VecDeque<(Command, StorageKey)>,
+    command_queue: VecDeque<Command>,
     records: Vec<(Instant, Duration)>,
 }
 
-enum Command {
-    Get,
-    Put,
+struct Command {
+    task: JoinHandle<anyhow::Result<(Instant, Duration)>>,
+    tx_bump: oneshot::Sender<()>,
 }
 
 impl Bench {
@@ -78,42 +80,23 @@ impl Bench {
 
     async fn run_inner(&mut self) -> anyhow::Result<()> {
         for _ in 0..=self.config.prefetch_offset {
-            self.push_command().await?
+            self.push_command()
         }
         let mut interval_start = Instant::now();
         let mut interval_start_num_record = 0;
         loop {
-            let start;
-            let Some((command, key)) = self.command_queue.pop_front() else {
+            let Some(command) = self.command_queue.pop_front() else {
                 unreachable!()
             };
-            let updates = match command {
-                Command::Put => {
-                    let mut value = vec![0; 68];
-                    self.rng.fill(&mut value[..]);
-                    start = Instant::now();
-                    vec![(key, Some(value.into()))]
+            let _ = command.tx_bump.send(());
+            match command.task.await {
+                Ok(Ok((start, elapsed))) => self.records.push((start, elapsed)),
+                err => {
+                    tracing::error!("{err:?}"); // probably unnecessary
+                    break;
                 }
-                Command::Get => {
-                    start = Instant::now();
-                    let (tx_value, rx_value) = oneshot::channel();
-                    let _ = self.tx_op.send(StorageOp::Fetch(key, tx_value)).await;
-                    let Ok(value) = rx_value.await else {
-                        break;
-                    };
-                    anyhow::ensure!(value.is_some(), "key not found");
-                    Default::default()
-                }
-            };
-            let (tx_ok, rx_ok) = oneshot::channel();
-            let _ = self.tx_op.send(StorageOp::Bump(updates, tx_ok)).await;
-            let Ok(()) = rx_ok.await else {
-                break;
-            };
-            let duration = start.elapsed();
-            self.records.push((start, duration));
-
-            self.push_command().await?;
+            }
+            self.push_command();
 
             let now = Instant::now();
             let elapsed = now.duration_since(interval_start);
@@ -128,22 +111,39 @@ impl Bench {
         Ok(())
     }
 
-    async fn push_command(&mut self) -> Result<(), anyhow::Error> {
-        let command = if self.rng.random_bool(self.config.put_ratio) {
-            Command::Put
-        } else {
-            Command::Get
-        };
-        let key = Self::uniform_key(self.rng.random_range(0..self.config.num_key));
-        if matches!(command, Command::Get) {
-            let (tx_ok, rx_ok) = oneshot::channel();
-            let _ = self.tx_op.send(StorageOp::Prefetch(key, tx_ok)).await;
-            // may should propagate to abort workload loop, but outer loop will abort itself for a
-            // later broken result channel for Fetch or Bump anyway
-            let _ = rx_ok.await;
+    fn push_command(&mut self) {
+        enum Workload {
+            Put(Bytes),
+            Get,
         }
-        self.command_queue.push_back((command, key));
-        Ok(())
+        let key = Self::uniform_key(self.rng.random_range(0..self.config.num_key));
+        let workload = if self.rng.random_bool(self.config.put_ratio) {
+            let mut bytes = vec![0; 68];
+            self.rng.fill(&mut bytes[..]);
+            Workload::Put(bytes.into())
+        } else {
+            Workload::Get
+        };
+        let tx_op = self.tx_op.clone();
+        let (tx_bump, rx_bump) = oneshot::channel();
+        let task = spawn(async move {
+            let start = Instant::now();
+            let updates = match workload {
+                Workload::Get => {
+                    let (tx_value, rx_value) = oneshot::channel();
+                    let _ = tx_op.send(StorageOp::Fetch(key, tx_value)).await;
+                    rx_value.await?;
+                    Default::default()
+                }
+                Workload::Put(value) => vec![(key, Some(value))],
+            };
+            rx_bump.await?;
+            let (tx_ok, rx_ok) = oneshot::channel();
+            let _ = tx_op.send(StorageOp::Bump(updates, tx_ok)).await;
+            rx_ok.await?;
+            Ok((start, start.elapsed()))
+        });
+        self.command_queue.push_back(Command { task, tx_bump });
     }
 
     fn uniform_key(index: u64) -> StorageKey {

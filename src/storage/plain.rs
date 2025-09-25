@@ -6,13 +6,8 @@ use std::{
 
 use bytes::Bytes;
 use rocksdb::{DB, WriteBatch};
-use tokio::{
-    select,
-    sync::{mpsc::Receiver, oneshot},
-    task::JoinSet,
-};
+use tokio::{select, sync::mpsc::Receiver, task::JoinSet};
 use tokio_util::sync::CancellationToken;
-use tracing::debug;
 
 use super::{StateVersion, StorageKey, StorageOp};
 
@@ -66,9 +61,6 @@ impl PlainSyncStorage {
                     self.db.write(batch)?;
                     let _ = tx_ok.send(());
                 }
-                StorageOp::Prefetch(_, tx_ok) => {
-                    let _ = tx_ok.send(());
-                }
                 StorageOp::VoteArchive(..) => unimplemented!(),
             }
         }
@@ -76,7 +68,7 @@ impl PlainSyncStorage {
     }
 }
 
-// this is pretty close to DBWorker + ActiveStateWorker + Storage::handle_op 
+// this is pretty close to DBWorker + ActiveStateWorker + Storage::handle_op
 // without sharding and network stuff
 // maybe should be unified, but feels hard and overkill
 pub struct PlainPrefetchStorage {
@@ -88,8 +80,7 @@ pub struct PlainPrefetchStorage {
     version: StateVersion,
     active_entries: HashMap<StorageKey, ActiveEntry>,
     active_entry_key_queue: BinaryHeap<Reverse<(StateVersion, StorageKey)>>,
-    fetch_tx_values: HashMap<StorageKey, oneshot::Sender<Option<Bytes>>>,
-    tasks: JoinSet<anyhow::Result<(StorageKey, ActiveEntry)>>,
+    tasks: JoinSet<anyhow::Result<()>>,
 }
 
 struct ActiveEntry {
@@ -106,7 +97,6 @@ impl PlainPrefetchStorage {
             version: 0,
             active_entries: Default::default(),
             active_entry_key_queue: Default::default(),
-            fetch_tx_values: Default::default(),
             tasks: JoinSet::new(),
         }
     }
@@ -121,7 +111,6 @@ impl PlainPrefetchStorage {
     }
 
     async fn run_inner(&mut self) -> anyhow::Result<()> {
-        self.db.put(b".version", "0")?;
         loop {
             enum Event<R> {
                 Op(StorageOp),
@@ -139,9 +128,13 @@ impl PlainPrefetchStorage {
                             let _ = tx_value.send(entry.value.clone());
                             continue;
                         }
-                        debug!("prefetch not complete in time");
-                        let replaced = self.fetch_tx_values.insert(storage_key, tx_value);
-                        anyhow::ensure!(replaced.is_none(), "duplicate fetch for the same key")
+                        let db = self.db.clone();
+                        // self.tasks.spawn(async move {
+                        self.tasks.spawn_blocking(move || {
+                            let value = db.get(storage_key.0)?;
+                            let _ = tx_value.send(value.map(Into::into));
+                            Ok(())
+                        });
                     }
                     StorageOp::Bump(items, tx_ok) => {
                         self.version += 1;
@@ -157,7 +150,6 @@ impl PlainPrefetchStorage {
                             }
                         }
                         let mut batch = WriteBatch::new();
-                        batch.put(b".version", self.version.to_string());
                         for (key, value) in items {
                             let entry = ActiveEntry {
                                 version: self.version,
@@ -174,39 +166,9 @@ impl PlainPrefetchStorage {
                         self.db.write(batch)?;
                         let _ = tx_ok.send(());
                     }
-                    StorageOp::Prefetch(storage_key, tx_ok) => {
-                        let _ = tx_ok.send(());
-                        let db = self.db.clone();
-                        self.tasks.spawn_blocking(move || {
-                            let snapshot = db.snapshot();
-                            let Some(version) = snapshot.get(b".version")? else {
-                                unimplemented!("no version found")
-                            };
-                            let value = snapshot.get(storage_key.0)?;
-                            let active_entry = ActiveEntry {
-                                version: str::from_utf8(&version)?.parse()?,
-                                value: value.map(Into::into),
-                            };
-                            Ok((storage_key, active_entry))
-                        });
-                    }
                     StorageOp::VoteArchive(..) => unimplemented!(),
                 },
-                Event::TaskResult(result) => {
-                    let (storage_key, active_entry) = result??;
-                    let entry = self.active_entries.entry(storage_key);
-                    if let Entry::Occupied(entry) = &entry
-                        && entry.get().version >= active_entry.version
-                    {
-                        continue;
-                    };
-                    if let Some(tx_value) = self.fetch_tx_values.remove(&storage_key) {
-                        let _ = tx_value.send(active_entry.value.clone());
-                    }
-                    self.active_entry_key_queue
-                        .push(Reverse((active_entry.version, storage_key)));
-                    entry.insert_entry(active_entry);
-                }
+                Event::TaskResult(result) => result??,
             }
         }
         Ok(())
