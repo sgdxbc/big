@@ -76,8 +76,8 @@ impl PlainSyncStorage {
     }
 }
 
-// this is pretty close to DBWorker + ActiveStateWorker + Storage::handle_op without sharding and
-// network stuff
+// this is pretty close to DBWorker + ActiveStateWorker + Storage::handle_op 
+// without sharding and network stuff
 // maybe should be unified, but feels hard and overkill
 pub struct PlainPrefetchStorage {
     db: Arc<DB>,

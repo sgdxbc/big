@@ -51,6 +51,12 @@ impl Debug for StorageKey {
     }
 }
 
+impl AsRef<[u8]> for StorageKey {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
 pub type StateVersion = u64;
 
 type BumpUpdates = Vec<(StorageKey, Option<Bytes>)>;
