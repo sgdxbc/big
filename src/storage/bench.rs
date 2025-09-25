@@ -66,6 +66,9 @@ impl Bench {
             .run_until_cancelled(self.run_inner())
             .await
             .unwrap_or(Ok(()))?;
+        for command in self.command_queue {
+            command.task.abort()
+        }
         if let (Some(first), Some(last)) = (self.records.first(), self.records.last()) {
             let total = last.0.duration_since(first.0) + last.1;
             let ops = self.records.len() as f64;
