@@ -24,7 +24,7 @@ use tracing::info;
 use crate::{network::NetworkId, storage::plain::PlainPrefetchStorage};
 
 use super::{
-    NodeIndex, StateVersion, StorageConfig, StorageKey, StorageOp,
+    BumpUpdates, NodeIndex, StateVersion, StorageConfig, StorageKey, StorageOp,
     network::Storage,
     plain::{PlainStorage, PlainSyncStorage},
 };
@@ -42,12 +42,13 @@ pub struct Bench {
 
     rng: StdRng,
     command_queue: VecDeque<Command>,
-    records: Vec<(Instant, Duration)>,
+    records: Vec<(Instant, Duration, Duration)>,
 }
 
 struct Command {
-    task: JoinHandle<anyhow::Result<(Instant, Duration)>>,
-    tx_bump: oneshot::Sender<()>,
+    start: Instant,
+    task: JoinHandle<anyhow::Result<Duration>>,
+    updates: BumpUpdates,
 }
 
 impl Bench {
@@ -73,8 +74,11 @@ impl Bench {
             let total = last.0.duration_since(first.0) + last.1;
             let ops = self.records.len() as f64;
             let tps = ops / total.as_secs_f64();
-            let mean = self.records.iter().map(|r| r.1).sum::<Duration>() / ops as u32;
-            println!("ops: {ops}, total: {total:.1?}, tps: {tps:.2}, mean latency: {mean:?}")
+            let fetch_mean = self.records.iter().map(|r| r.1).sum::<Duration>() / ops as u32;
+            let bump_mean = self.records.iter().map(|r| r.2).sum::<Duration>() / ops as u32;
+            println!(
+                "ops: {ops}, total: {total:.1?}, tps: {tps:.2}, mean latency: fetch {fetch_mean:?} bump {bump_mean:?}"
+            )
         } else {
             println!("no operations performed")
         }
@@ -91,14 +95,22 @@ impl Bench {
             let Some(command) = self.command_queue.pop_front() else {
                 unreachable!()
             };
-            let _ = command.tx_bump.send(());
-            match command.task.await {
-                Ok(Ok((start, elapsed))) => self.records.push((start, elapsed)),
-                err => {
-                    tracing::error!("{err:?}"); // probably unnecessary
+            let Ok(Ok(fetch_latency)) = command.task.await else {
+                break;
+            };
+            let start = Instant::now();
+            if !command.updates.is_empty() {
+                let (tx_ok, rx_ok) = oneshot::channel();
+                let _ = self
+                    .tx_op
+                    .send(StorageOp::Bump(command.updates, tx_ok))
+                    .await;
+                let Ok(()) = rx_ok.await else {
                     break;
-                }
+                };
             }
+            self.records
+                .push((command.start, fetch_latency, start.elapsed()));
             self.push_command();
 
             let now = Instant::now();
@@ -128,25 +140,28 @@ impl Bench {
             Workload::Get
         };
         let tx_op = self.tx_op.clone();
-        let (tx_bump, rx_bump) = oneshot::channel();
-        let task = spawn(async move {
-            let start = Instant::now();
-            let updates = match workload {
-                Workload::Get => {
+        let start = Instant::now();
+        let (task, updates) = match workload {
+            Workload::Get => {
+                let task = spawn(async move {
+                    let start = Instant::now();
                     let (tx_value, rx_value) = oneshot::channel();
                     let _ = tx_op.send(StorageOp::Fetch(key, tx_value)).await;
                     rx_value.await?;
-                    Default::default()
-                }
-                Workload::Put(value) => vec![(key, Some(value))],
-            };
-            rx_bump.await?;
-            let (tx_ok, rx_ok) = oneshot::channel();
-            let _ = tx_op.send(StorageOp::Bump(updates, tx_ok)).await;
-            rx_ok.await?;
-            Ok((start, start.elapsed()))
+                    Ok(start.elapsed())
+                });
+                (task, Default::default())
+            }
+            Workload::Put(value) => (
+                spawn(async move { Ok(Duration::ZERO) }),
+                vec![(key, Some(value))],
+            ),
+        };
+        self.command_queue.push_back(Command {
+            start,
+            task,
+            updates,
         });
-        self.command_queue.push_back(Command { task, tx_bump });
     }
 
     fn uniform_key(index: u64) -> StorageKey {

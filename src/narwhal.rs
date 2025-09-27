@@ -49,7 +49,7 @@ pub struct NarwhalConfig {
 
 impl NarwhalConfig {
     fn is_bullshark_leader(&self, node_index: NodeIndex, round: Round) -> bool {
-        round % 2 == 0 && node_index == (round / 2 % self.num_node as Round) as NodeIndex
+        round.is_multiple_of(2) && node_index == (round / 2 % self.num_node as Round) as NodeIndex
     }
 }
 
