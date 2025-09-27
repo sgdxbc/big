@@ -85,47 +85,6 @@ impl Bench {
         Ok(())
     }
 
-    async fn run_inner(&mut self) -> anyhow::Result<()> {
-        for _ in 0..=self.config.prefetch_offset {
-            self.push_command()
-        }
-        let mut interval_start = Instant::now();
-        let mut interval_start_num_record = 0;
-        loop {
-            let Some(command) = self.command_queue.pop_front() else {
-                unreachable!()
-            };
-            let Ok(Ok(fetch_latency)) = command.task.await else {
-                break;
-            };
-            let start = Instant::now();
-            if !command.updates.is_empty() {
-                let (tx_ok, rx_ok) = oneshot::channel();
-                let _ = self
-                    .tx_op
-                    .send(StorageOp::Bump(command.updates, tx_ok))
-                    .await;
-                let Ok(()) = rx_ok.await else {
-                    break;
-                };
-            }
-            self.records
-                .push((command.start, fetch_latency, start.elapsed()));
-            self.push_command();
-
-            let now = Instant::now();
-            let elapsed = now.duration_since(interval_start);
-            if elapsed >= Duration::from_secs(1) {
-                interval_start = now;
-                let interval_num_record = self.records.len()
-                    - replace(&mut interval_start_num_record, self.records.len());
-                let tps = interval_num_record as f64 / elapsed.as_secs_f64();
-                info!("interval tps: {tps:.2}")
-            }
-        }
-        Ok(())
-    }
-
     fn push_command(&mut self) {
         enum Workload {
             Put(Bytes),
@@ -164,6 +123,45 @@ impl Bench {
         });
     }
 
+    async fn run_inner(&mut self) -> anyhow::Result<()> {
+        for _ in 0..=self.config.prefetch_offset {
+            self.push_command()
+        }
+        let mut interval_start = Instant::now();
+        let mut interval_start_num_record = 0;
+        loop {
+            let Some(command) = self.command_queue.pop_front() else {
+                unreachable!()
+            };
+            let Ok(Ok(fetch_latency)) = command.task.await else {
+                break;
+            };
+            let start = Instant::now();
+            let (tx_ok, rx_ok) = oneshot::channel();
+            let _ = self
+                .tx_op
+                .send(StorageOp::Bump(command.updates, tx_ok))
+                .await;
+            let Ok(()) = rx_ok.await else {
+                break;
+            };
+            self.records
+                .push((command.start, fetch_latency, start.elapsed()));
+            self.push_command();
+
+            let now = Instant::now();
+            let elapsed = now.duration_since(interval_start);
+            if elapsed >= Duration::from_secs(1) {
+                interval_start = now;
+                let interval_num_record = self.records.len()
+                    - replace(&mut interval_start_num_record, self.records.len());
+                let tps = interval_num_record as f64 / elapsed.as_secs_f64();
+                info!("interval tps: {tps:.2}")
+            }
+        }
+        Ok(())
+    }
+
     fn uniform_key(index: u64) -> StorageKey {
         StorageKey(StdRng::seed_from_u64(index).random())
     }
@@ -188,7 +186,7 @@ impl BenchPlainStorage {
     pub fn new(prefetch: bool, config: BenchConfig, db: Arc<DB>) -> Self {
         let (tx_op, rx_op) = channel(1);
         let plain_storage = if prefetch {
-            PlainStorage::Prefetch(PlainPrefetchStorage::new(db, config.prefetch_offset, rx_op))
+            PlainStorage::Prefetch(PlainPrefetchStorage::new(db, rx_op))
         } else {
             PlainStorage::Sync(PlainSyncStorage::new(db, rx_op))
         };
@@ -224,7 +222,7 @@ impl BenchStorage {
         node_table: Vec<NetworkId>,
         tx_start: oneshot::Sender<()>,
     ) -> Self {
-        let (tx_op, rx_op) = channel(1);
+        let (tx_op, rx_op) = channel(100);
 
         let bench = Bench::new(bench_config, tx_op);
         let storage = Storage::new(

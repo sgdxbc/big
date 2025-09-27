@@ -2,9 +2,10 @@ use std::{env::args, fs, path::Path, sync::Arc, time::Duration};
 
 use big::{
     logging::init_logging_file,
-    parse::Configs,
+    narwhal::NodeIndex,
+    parse::{Configs, Extract},
     storage::{
-        Storage,
+        Storage, StripeIndex,
         bench::{Bench, BenchPlainStorage, BenchStorage},
         plain::PlainStorage,
     },
@@ -38,6 +39,28 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
+#[allow(unused)]
+#[derive(Debug)]
+struct DbConfig {
+    num_key: u64,
+    plain_storage: bool,
+    num_faulty_node: NodeIndex,
+    num_stripe: StripeIndex,
+    num_backup: NodeIndex,
+}
+
+impl Extract for DbConfig {
+    fn extract(configs: &Configs) -> anyhow::Result<Self> {
+        Ok(Self {
+            num_key: configs.get("bench.num-key")?,
+            plain_storage: configs.get("big.plain-storage")?,
+            num_faulty_node: configs.get("big.num-faulty-node")?,
+            num_stripe: configs.get("big.num-stripe")?,
+            num_backup: configs.get("big.num-backup")?,
+        })
+    }
+}
+
 #[tokio::main]
 async fn role_prefill(configs: Configs, index: u16) -> anyhow::Result<()> {
     if index >= configs.get("big.num-node")? {
@@ -53,7 +76,7 @@ async fn role_prefill(configs: Configs, index: u16) -> anyhow::Result<()> {
     options.increase_parallelism(std::thread::available_parallelism()?.get() as _);
     options.set_max_subcompactions(std::thread::available_parallelism()?.get() as _);
     let db = DB::open(&options, path)?;
-    db.put(".configs", configs.to_string())?;
+    db.put(".configs", format!("{:?}", configs.extract::<DbConfig>()?))?;
     let items = Bench::prefill_items(configs.extract()?);
     if configs.get("big.plain-storage")? {
         PlainStorage::prefill(db, items).await
@@ -94,7 +117,7 @@ async fn role_bench(configs: Configs, index: u16) -> anyhow::Result<()> {
     let db = Arc::new(DB::open(&options, temp_dir.path())?);
     let prefill_configs = db.get_pinned(".configs")?;
     if let Some(prefill_configs) = prefill_configs
-        && &*prefill_configs == configs.to_string().as_bytes()
+        && &*prefill_configs == format!("{:?}", configs.extract::<DbConfig>()?).as_bytes()
     {
     } else {
         anyhow::bail!("mismatched configs")

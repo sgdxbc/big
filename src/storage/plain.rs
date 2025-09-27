@@ -1,15 +1,11 @@
-use std::{
-    cmp::Reverse,
-    collections::{BinaryHeap, HashMap, hash_map::Entry},
-    sync::Arc,
-};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use rocksdb::{DB, WriteBatch};
 use tokio::{select, sync::mpsc::Receiver, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 
-use super::{StateVersion, StorageKey, StorageOp};
+use super::{StorageKey, StorageOp};
 
 pub enum PlainStorage {
     Sync(PlainSyncStorage),
@@ -73,30 +69,17 @@ impl PlainSyncStorage {
 // maybe should be unified, but feels hard and overkill
 pub struct PlainPrefetchStorage {
     db: Arc<DB>,
-    prefetch_offset: StateVersion,
 
     rx_op: Receiver<StorageOp>,
 
-    version: StateVersion,
-    active_entries: HashMap<StorageKey, ActiveEntry>,
-    active_entry_key_queue: BinaryHeap<Reverse<(StateVersion, StorageKey)>>,
     tasks: JoinSet<anyhow::Result<()>>,
 }
 
-struct ActiveEntry {
-    version: StateVersion,
-    value: Option<Bytes>,
-}
-
 impl PlainPrefetchStorage {
-    pub fn new(db: Arc<DB>, prefetch_offset: StateVersion, rx_op: Receiver<StorageOp>) -> Self {
+    pub fn new(db: Arc<DB>, rx_op: Receiver<StorageOp>) -> Self {
         Self {
             db,
-            prefetch_offset,
             rx_op,
-            version: 0,
-            active_entries: Default::default(),
-            active_entry_key_queue: Default::default(),
             tasks: JoinSet::new(),
         }
     }
@@ -123,11 +106,6 @@ impl PlainPrefetchStorage {
             } {
                 Event::Op(op) => match op {
                     StorageOp::Fetch(storage_key, tx_value) => {
-                        if let Some(entry) = self.active_entries.get(&storage_key) {
-                            assert!(entry.version + self.prefetch_offset >= self.version);
-                            let _ = tx_value.send(entry.value.clone());
-                            continue;
-                        }
                         let db = self.db.clone();
                         // self.tasks.spawn(async move {
                         self.tasks.spawn_blocking(move || {
@@ -137,33 +115,16 @@ impl PlainPrefetchStorage {
                         });
                     }
                     StorageOp::Bump(items, tx_ok) => {
-                        self.version += 1;
-                        while let Some(&Reverse((version, _))) = self.active_entry_key_queue.peek()
-                            && version + self.prefetch_offset < self.version
-                        {
-                            let Reverse((_, key)) = self.active_entry_key_queue.pop().unwrap();
-                            let Entry::Occupied(entry) = self.active_entries.entry(key) else {
-                                unreachable!()
-                            };
-                            if entry.get().version == version {
-                                entry.remove();
-                            }
-                        }
                         let mut batch = WriteBatch::new();
                         for (key, value) in items {
-                            let entry = ActiveEntry {
-                                version: self.version,
-                                value: value.clone(),
-                            };
-                            self.active_entries.insert(key, entry);
-                            self.active_entry_key_queue
-                                .push(Reverse((self.version, key)));
                             match value {
                                 Some(value) => batch.put(key.0, &value),
                                 None => batch.delete(key.0),
                             }
                         }
-                        self.db.write(batch)?;
+                        if !batch.is_empty() {
+                            self.db.write(batch)?
+                        }
                         let _ = tx_ok.send(());
                     }
                     StorageOp::VoteArchive(..) => unimplemented!(),

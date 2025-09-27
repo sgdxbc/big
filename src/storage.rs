@@ -87,7 +87,7 @@ impl Debug for StorageOp {
 // `StorageKey`s. the _parity_ shards that no `StorageKey` maps to have no
 // ShardIndex
 pub type ShardIndex = u32;
-type StripeIndex = u32;
+pub type StripeIndex = u32;
 
 #[derive(Clone)]
 pub struct StorageConfig {
