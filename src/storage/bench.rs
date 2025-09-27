@@ -7,6 +7,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use hdrhistogram::Histogram;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use rocksdb::DB;
 use tokio::{
@@ -42,12 +43,20 @@ pub struct Bench {
 
     rng: StdRng,
     command_queue: VecDeque<Command>,
-    records: Vec<(Instant, Duration, Duration)>,
+
+    latencies: BenchLatencies,
+}
+
+struct BenchLatencies {
+    command: Histogram<u64>,
+    fetch_sync: Histogram<u64>,
+    fetch: Histogram<u64>,
+    bump: Histogram<u64>,
 }
 
 struct Command {
     start: Instant,
-    task: JoinHandle<anyhow::Result<Duration>>,
+    task: Option<JoinHandle<anyhow::Result<Duration>>>,
     updates: BumpUpdates,
 }
 
@@ -58,30 +67,35 @@ impl Bench {
             tx_op,
             rng: StdRng::seed_from_u64(117418),
             command_queue: Default::default(),
-            records: Default::default(),
+            latencies: BenchLatencies {
+                command: Histogram::new(3).unwrap(),
+                fetch_sync: Histogram::new(3).unwrap(),
+                fetch: Histogram::new(3).unwrap(),
+                bump: Histogram::new(3).unwrap(),
+            },
         }
     }
 
     pub async fn run(mut self, cancel: CancellationToken) -> anyhow::Result<()> {
+        let start = Instant::now();
         cancel
             .run_until_cancelled(self.run_inner())
             .await
             .unwrap_or(Ok(()))?;
         for command in self.command_queue {
-            command.task.abort()
+            if let Some(task) = command.task {
+                task.abort()
+            }
         }
-        if let (Some(first), Some(last)) = (self.records.first(), self.records.last()) {
-            let total = last.0.duration_since(first.0) + last.1;
-            let ops = self.records.len() as f64;
-            let tps = ops / total.as_secs_f64();
-            let fetch_mean = self.records.iter().map(|r| r.1).sum::<Duration>() / ops as u32;
-            let bump_mean = self.records.iter().map(|r| r.2).sum::<Duration>() / ops as u32;
-            println!(
-                "ops: {ops}, total: {total:.1?}, tps: {tps:.2}, mean latency: fetch {fetch_mean:?} bump {bump_mean:?}"
-            )
-        } else {
-            println!("no operations performed")
-        }
+        let ops = self.latencies.command.len();
+        let total = start.elapsed();
+        let tps = ops as f64 / total.as_secs_f64();
+        let fetch_mean = Duration::from_nanos(self.latencies.fetch.mean() as _);
+        let fetch_sync_mean = Duration::from_nanos(self.latencies.fetch_sync.mean() as _);
+        let bump_mean = Duration::from_nanos(self.latencies.bump.mean() as _);
+        println!(
+            "ops: {ops}, total: {total:.1?}, tps: {tps:.2}, mean latency: fetch {fetch_mean:?} fetch_sync {fetch_sync_mean:?} bump {bump_mean:?}"
+        );
         Ok(())
     }
 
@@ -99,7 +113,6 @@ impl Bench {
             Workload::Get
         };
         let tx_op = self.tx_op.clone();
-        let start = Instant::now();
         let (task, updates) = match workload {
             Workload::Get => {
                 let task = spawn(async move {
@@ -109,15 +122,12 @@ impl Bench {
                     rx_value.await?;
                     Ok(start.elapsed())
                 });
-                (task, Default::default())
+                (Some(task), Default::default())
             }
-            Workload::Put(value) => (
-                spawn(async move { Ok(Duration::ZERO) }),
-                vec![(key, Some(value))],
-            ),
+            Workload::Put(value) => (None, vec![(key, Some(value))]),
         };
         self.command_queue.push_back(Command {
-            start,
+            start: Instant::now(),
             task,
             updates,
         });
@@ -133,9 +143,14 @@ impl Bench {
             let Some(command) = self.command_queue.pop_front() else {
                 unreachable!()
             };
-            let Ok(Ok(fetch_latency)) = command.task.await else {
-                break;
-            };
+            if let Some(task) = command.task {
+                let start = Instant::now();
+                let Ok(Ok(fetch_latency)) = task.await else {
+                    break;
+                };
+                self.latencies.fetch_sync += start.elapsed().as_nanos() as u64;
+                self.latencies.fetch += fetch_latency.as_nanos() as u64
+            }
             let start = Instant::now();
             let (tx_ok, rx_ok) = oneshot::channel();
             let _ = self
@@ -145,16 +160,16 @@ impl Bench {
             let Ok(()) = rx_ok.await else {
                 break;
             };
-            self.records
-                .push((command.start, fetch_latency, start.elapsed()));
+            self.latencies.bump += start.elapsed().as_nanos() as u64;
+            self.latencies.command += command.start.elapsed().as_nanos() as u64;
             self.push_command();
 
             let now = Instant::now();
             let elapsed = now.duration_since(interval_start);
             if elapsed >= Duration::from_secs(1) {
                 interval_start = now;
-                let interval_num_record = self.records.len()
-                    - replace(&mut interval_start_num_record, self.records.len());
+                let interval_num_record = self.latencies.command.len()
+                    - replace(&mut interval_start_num_record, self.latencies.command.len());
                 let tps = interval_num_record as f64 / elapsed.as_secs_f64();
                 info!("interval tps: {tps:.2}")
             }
@@ -198,10 +213,22 @@ impl BenchPlainStorage {
     }
 
     pub async fn run(self, cancel: CancellationToken) -> anyhow::Result<()> {
-        try_join!(
-            self.plain_storage.run(cancel.clone()),
-            self.bench.run(cancel)
-        )?;
+        // try_join!(
+        //     self.plain_storage.run(cancel.clone()),
+        //     self.bench.run(cancel)
+        // )?;
+        let storage = spawn(self.plain_storage.run(cancel.clone()));
+        let storage = async move {
+            storage.await??;
+            anyhow::Ok(())
+        };
+        let bench = spawn(self.bench.run(cancel));
+        let bench = async move {
+            bench.await??;
+            anyhow::Ok(())
+        };
+        try_join!(storage, bench)?;
+
         Ok(())
     }
 }
@@ -239,7 +266,18 @@ impl BenchStorage {
     }
 
     pub async fn run(self, cancel: CancellationToken) -> anyhow::Result<()> {
-        try_join!(self.storage.run(cancel.clone()), self.bench.run(cancel))?;
+        // try_join!(self.storage.run(cancel.clone()), self.bench.run(cancel))?;
+        let storage = spawn(self.storage.run(cancel.clone()));
+        let storage = async move {
+            storage.await??;
+            anyhow::Ok(())
+        };
+        let bench = spawn(self.bench.run(cancel));
+        let bench = async move {
+            bench.await??;
+            anyhow::Ok(())
+        };
+        try_join!(storage, bench)?;
         Ok(())
     }
 }
