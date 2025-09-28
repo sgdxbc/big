@@ -1,4 +1,5 @@
 use std::{
+    fmt::Display,
     mem::replace,
     net::SocketAddr,
     sync::Arc,
@@ -6,7 +7,6 @@ use std::{
 };
 
 use bytes::Bytes;
-use hdrhistogram::Histogram;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use rocksdb::DB;
 use tokio::{
@@ -20,7 +20,7 @@ use tokio::{
 use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 use tracing::info;
 
-use crate::{network::NetworkId, storage::plain::PlainPrefetchStorage};
+use crate::{latency::Latency, network::NetworkId, storage::plain::PlainPrefetchStorage};
 
 use super::{
     BumpUpdates, NodeIndex, StateVersion, StorageConfig, StorageKey, StorageOp,
@@ -109,11 +109,21 @@ pub struct Bench {
     rx_command: Receiver<Command>,
 }
 
+#[derive(Default)]
 struct BenchLatencies {
-    command: Histogram<u64>,
-    fetch_sync: Histogram<u64>,
-    fetch: Histogram<u64>,
-    bump: Histogram<u64>,
+    command: Latency,
+    fetch_sync: Latency,
+    fetch: Latency,
+    bump: Latency,
+}
+
+impl Display for BenchLatencies {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "command: {}", self.command)?;
+        writeln!(f, "fetch_sync: {}", self.fetch_sync)?;
+        writeln!(f, "fetch: {}", self.fetch)?;
+        writeln!(f, "bump: {}", self.bump)
+    }
 }
 
 impl Bench {
@@ -122,12 +132,7 @@ impl Bench {
         let generate = BenchProduce::new(config, tx_command, tx_op.clone());
         Self {
             tx_op,
-            latencies: BenchLatencies {
-                command: Histogram::new(3).unwrap(),
-                fetch_sync: Histogram::new(3).unwrap(),
-                fetch: Histogram::new(3).unwrap(),
-                bump: Histogram::new(3).unwrap(),
-            },
+            latencies: Default::default(),
             produce: Some(generate),
             rx_command,
         }
@@ -153,12 +158,15 @@ impl Bench {
         let ops = self.latencies.command.len();
         let total = start.elapsed();
         let tps = ops as f64 / total.as_secs_f64();
-        let fetch_mean = Duration::from_nanos(self.latencies.fetch.mean() as _);
-        let fetch_sync_mean = Duration::from_nanos(self.latencies.fetch_sync.mean() as _);
-        let bump_mean = Duration::from_nanos(self.latencies.bump.mean() as _);
-        let command_mean = Duration::from_nanos(self.latencies.command.mean() as _);
+        println!("ops: {ops}, total: {total:.1?}, tps: {tps:.2}");
         println!(
-            "ops: {ops}, total: {total:.1?}, tps: {tps:.2}, mean latency: command {command_mean:?} fetch {fetch_mean:?} fetch_sync {fetch_sync_mean:?} bump {bump_mean:?}"
+            "latencies:\n{}",
+            self.latencies
+                .to_string()
+                .lines()
+                .map(|l| format!("  {l}"))
+                .collect::<Vec<_>>()
+                .join("\n")
         );
         Ok(())
     }
@@ -168,11 +176,11 @@ impl Bench {
         let mut interval_start_num_record = 0;
         while let Some(command) = self.rx_command.recv().await {
             if let Some(task) = command.task {
-                let start = Instant::now();
+                let record = self.latencies.fetch_sync.record();
                 let Ok(Ok(fetch_latency)) = task.await else {
                     break;
                 };
-                self.latencies.fetch_sync += start.elapsed().as_nanos() as u64;
+                record.stop();
                 self.latencies.fetch += fetch_latency.as_nanos() as u64
             }
             let start = Instant::now();

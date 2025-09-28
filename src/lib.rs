@@ -4,6 +4,7 @@ pub mod narwhal;
 pub mod network;
 pub mod parse;
 pub mod storage;
+pub mod latency;
 
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
