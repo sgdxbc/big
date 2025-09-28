@@ -1,5 +1,4 @@
 use std::{
-    collections::VecDeque,
     mem::replace,
     net::SocketAddr,
     sync::Arc,
@@ -13,13 +12,12 @@ use rocksdb::DB;
 use tokio::{
     spawn,
     sync::{
-        mpsc::{Sender, channel},
+        mpsc::{Receiver, Sender, channel},
         oneshot,
     },
-    task::JoinHandle,
     try_join,
 };
-use tokio_util::sync::CancellationToken;
+use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 use tracing::info;
 
 use crate::{network::NetworkId, storage::plain::PlainPrefetchStorage};
@@ -30,21 +28,85 @@ use super::{
     plain::{PlainStorage, PlainSyncStorage},
 };
 
+#[derive(Clone)]
 pub struct BenchConfig {
     num_key: u64,
     put_ratio: f64,
     prefetch_offset: StateVersion,
 }
 
-pub struct Bench {
+struct BenchProduce {
     config: BenchConfig,
 
+    tx_command: Sender<Command>,
     tx_op: Sender<StorageOp>,
 
     rng: StdRng,
-    command_queue: VecDeque<Command>,
+}
+
+struct Command {
+    start: Instant,
+    task: Option<AbortOnDropHandle<anyhow::Result<Duration>>>,
+    updates: BumpUpdates,
+}
+
+impl BenchProduce {
+    fn new(config: BenchConfig, tx_command: Sender<Command>, tx_op: Sender<StorageOp>) -> Self {
+        Self {
+            config,
+            tx_command,
+            tx_op,
+            rng: StdRng::seed_from_u64(117418),
+        }
+    }
+
+    async fn run(mut self) {
+        loop {
+            enum Workload {
+                Put(Bytes),
+                Get,
+            }
+            let key = Bench::uniform_key(self.rng.random_range(0..self.config.num_key));
+            let workload = if self.rng.random_bool(self.config.put_ratio) {
+                let mut bytes = vec![0; 68];
+                self.rng.fill(&mut bytes[..]);
+                Workload::Put(bytes.into())
+            } else {
+                Workload::Get
+            };
+            let tx_op = self.tx_op.clone();
+            let (task, updates) = match workload {
+                Workload::Get => {
+                    let task = spawn(async move {
+                        let start = Instant::now();
+                        let (tx_value, rx_value) = oneshot::channel();
+                        let _ = tx_op.send(StorageOp::Fetch(key, tx_value)).await;
+                        rx_value.await?;
+                        Ok(start.elapsed())
+                    });
+                    (Some(AbortOnDropHandle::new(task)), Default::default())
+                }
+                Workload::Put(value) => (None, vec![(key, Some(value))]),
+            };
+            let _ = self
+                .tx_command
+                .send(Command {
+                    start: Instant::now(),
+                    task,
+                    updates,
+                })
+                .await;
+        }
+    }
+}
+
+pub struct Bench {
+    tx_op: Sender<StorageOp>,
 
     latencies: BenchLatencies,
+
+    produce: Option<BenchProduce>,
+    rx_command: Receiver<Command>,
 }
 
 struct BenchLatencies {
@@ -54,95 +116,57 @@ struct BenchLatencies {
     bump: Histogram<u64>,
 }
 
-struct Command {
-    start: Instant,
-    task: Option<JoinHandle<anyhow::Result<Duration>>>,
-    updates: BumpUpdates,
-}
-
 impl Bench {
     pub fn new(config: BenchConfig, tx_op: Sender<StorageOp>) -> Self {
+        let (tx_command, rx_command) = channel((config.prefetch_offset + 1) as _);
+        let generate = BenchProduce::new(config, tx_command, tx_op.clone());
         Self {
-            config,
             tx_op,
-            rng: StdRng::seed_from_u64(117418),
-            command_queue: Default::default(),
             latencies: BenchLatencies {
                 command: Histogram::new(3).unwrap(),
                 fetch_sync: Histogram::new(3).unwrap(),
                 fetch: Histogram::new(3).unwrap(),
                 bump: Histogram::new(3).unwrap(),
             },
+            produce: Some(generate),
+            rx_command,
         }
     }
 
     pub async fn run(mut self, cancel: CancellationToken) -> anyhow::Result<()> {
+        let produce = self.produce.take().unwrap();
+        let produce = AbortOnDropHandle::new(spawn(produce.run()));
+
         let start = Instant::now();
         cancel
             .run_until_cancelled(self.run_inner())
             .await
             .unwrap_or(Ok(()))?;
-        for command in self.command_queue {
+
+        produce.abort();
+        while let Some(command) = self.rx_command.recv().await {
             if let Some(task) = command.task {
                 task.abort()
             }
         }
+
         let ops = self.latencies.command.len();
         let total = start.elapsed();
         let tps = ops as f64 / total.as_secs_f64();
         let fetch_mean = Duration::from_nanos(self.latencies.fetch.mean() as _);
         let fetch_sync_mean = Duration::from_nanos(self.latencies.fetch_sync.mean() as _);
         let bump_mean = Duration::from_nanos(self.latencies.bump.mean() as _);
+        let command_mean = Duration::from_nanos(self.latencies.command.mean() as _);
         println!(
-            "ops: {ops}, total: {total:.1?}, tps: {tps:.2}, mean latency: fetch {fetch_mean:?} fetch_sync {fetch_sync_mean:?} bump {bump_mean:?}"
+            "ops: {ops}, total: {total:.1?}, tps: {tps:.2}, mean latency: command {command_mean:?} fetch {fetch_mean:?} fetch_sync {fetch_sync_mean:?} bump {bump_mean:?}"
         );
         Ok(())
     }
 
-    fn push_command(&mut self) {
-        enum Workload {
-            Put(Bytes),
-            Get,
-        }
-        let key = Self::uniform_key(self.rng.random_range(0..self.config.num_key));
-        let workload = if self.rng.random_bool(self.config.put_ratio) {
-            let mut bytes = vec![0; 68];
-            self.rng.fill(&mut bytes[..]);
-            Workload::Put(bytes.into())
-        } else {
-            Workload::Get
-        };
-        let tx_op = self.tx_op.clone();
-        let (task, updates) = match workload {
-            Workload::Get => {
-                let task = spawn(async move {
-                    let start = Instant::now();
-                    let (tx_value, rx_value) = oneshot::channel();
-                    let _ = tx_op.send(StorageOp::Fetch(key, tx_value)).await;
-                    rx_value.await?;
-                    Ok(start.elapsed())
-                });
-                (Some(task), Default::default())
-            }
-            Workload::Put(value) => (None, vec![(key, Some(value))]),
-        };
-        self.command_queue.push_back(Command {
-            start: Instant::now(),
-            task,
-            updates,
-        });
-    }
-
     async fn run_inner(&mut self) -> anyhow::Result<()> {
-        for _ in 0..=self.config.prefetch_offset {
-            self.push_command()
-        }
         let mut interval_start = Instant::now();
         let mut interval_start_num_record = 0;
-        loop {
-            let Some(command) = self.command_queue.pop_front() else {
-                unreachable!()
-            };
+        while let Some(command) = self.rx_command.recv().await {
             if let Some(task) = command.task {
                 let start = Instant::now();
                 let Ok(Ok(fetch_latency)) = task.await else {
@@ -162,7 +186,6 @@ impl Bench {
             };
             self.latencies.bump += start.elapsed().as_nanos() as u64;
             self.latencies.command += command.start.elapsed().as_nanos() as u64;
-            self.push_command();
 
             let now = Instant::now();
             let elapsed = now.duration_since(interval_start);
