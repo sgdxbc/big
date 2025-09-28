@@ -4,10 +4,24 @@ import clusters
 
 
 def build_task(build_host):
-    Ssh(
-        build_host,
-        "/bin/bash -l -c 'which cargo' || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --profile minimal -y",
-    ).wait()
+    try:
+        Ssh(
+            build_host,
+            "/bin/bash -l -c 'which cargo2'"
+        ).wait()
+    except:
+        Ssh(
+            build_host,
+            "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --profile minimal -y"
+        ).wait()
+        Ssh(
+            build_host,
+            "curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash -l"
+        ).wait()
+        Ssh(
+            build_host,
+            "bash -l -c 'cargo binstall -y cargo-sweep'"
+        ).wait()
     Ssh(
         build_host,
         "/bin/bash -l -c 'which cc' || (sudo apt-get update && sudo apt-get install -y clang make)",

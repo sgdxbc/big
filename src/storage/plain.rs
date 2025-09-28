@@ -1,9 +1,19 @@
-use std::sync::Arc;
+use std::{fmt::Display, sync::Arc};
 
 use bytes::Bytes;
 use rocksdb::{DB, WriteBatch};
-use tokio::{select, sync::mpsc::Receiver, task::JoinSet};
-use tokio_util::sync::CancellationToken;
+use tokio::{
+    select,
+    sync::{
+        mpsc::{Receiver, Sender, channel},
+        oneshot,
+    },
+    task::JoinSet,
+};
+use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
+use tracing::info;
+
+use crate::latency::Latency;
 
 use super::{StorageKey, StorageOp};
 
@@ -15,8 +25,8 @@ pub enum PlainStorage {
 impl PlainStorage {
     pub async fn run(self, cancel: CancellationToken) -> anyhow::Result<()> {
         match self {
-            Self::Sync(mut s) => s.run(cancel).await,
-            Self::Prefetch(mut s) => s.run(cancel).await,
+            Self::Sync(s) => s.run(cancel).await,
+            Self::Prefetch(s) => s.run(cancel).await,
         }
     }
 }
@@ -32,7 +42,7 @@ impl PlainSyncStorage {
         Self { db, rx_op }
     }
 
-    pub async fn run(&mut self, cancel: CancellationToken) -> anyhow::Result<()> {
+    pub async fn run(mut self, cancel: CancellationToken) -> anyhow::Result<()> {
         cancel
             .run_until_cancelled(self.run_inner())
             .await
@@ -73,23 +83,52 @@ pub struct PlainPrefetchStorage {
     rx_op: Receiver<StorageOp>,
 
     tasks: JoinSet<anyhow::Result<()>>,
+
+    latencies: PlainPrefetchStorageLatencies,
+
+    fetch: Option<PlainPrefetch>,
+    tx_fetch: Sender<(StorageKey, oneshot::Sender<Option<Bytes>>)>,
+}
+
+#[derive(Default)]
+struct PlainPrefetchStorageLatencies {
+    fetch: Latency,
+    bump: Latency,
+}
+
+impl Display for PlainPrefetchStorageLatencies {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "fetch: {}", self.fetch)?;
+        write!(f, "bump: {}", self.bump)
+    }
 }
 
 impl PlainPrefetchStorage {
     pub fn new(db: Arc<DB>, rx_op: Receiver<StorageOp>) -> Self {
+        let (tx_fetch, rx_fetch) = channel(100);
+        let fetch = PlainPrefetch::new(db.clone(), rx_fetch);
         Self {
             db,
             rx_op,
             tasks: JoinSet::new(),
+            latencies: Default::default(),
+            fetch: Some(fetch),
+            tx_fetch,
         }
     }
 
-    pub async fn run(&mut self, cancel: CancellationToken) -> anyhow::Result<()> {
+    pub async fn run(mut self, cancel: CancellationToken) -> anyhow::Result<()> {
+        let fetch = self.fetch.take().unwrap();
+        let fetch = AbortOnDropHandle::new(tokio::spawn(fetch.run(cancel.clone())));
+
         cancel
             .run_until_cancelled(self.run_inner())
             .await
             .unwrap_or(Ok(()))?;
         self.tasks.shutdown().await;
+        fetch.abort();
+
+        info!("latencies:\n{}", self.latencies);
         Ok(())
     }
 
@@ -106,15 +145,12 @@ impl PlainPrefetchStorage {
             } {
                 Event::Op(op) => match op {
                     StorageOp::Fetch(storage_key, tx_value) => {
-                        let db = self.db.clone();
-                        // self.tasks.spawn(async move {
-                        self.tasks.spawn_blocking(move || {
-                            let value = db.get(storage_key.0)?;
-                            let _ = tx_value.send(value.map(Into::into));
-                            Ok(())
-                        });
+                        let record = self.latencies.fetch.record();
+                        let _ = self.tx_fetch.send((storage_key, tx_value)).await;
+                        record.stop()
                     }
                     StorageOp::Bump(items, tx_ok) => {
+                        let record = self.latencies.bump.record();
                         let mut batch = WriteBatch::new();
                         for (key, value) in items {
                             match value {
@@ -126,9 +162,62 @@ impl PlainPrefetchStorage {
                             self.db.write(batch)?
                         }
                         let _ = tx_ok.send(());
+                        record.stop()
                     }
                     StorageOp::VoteArchive(..) => unimplemented!(),
                 },
+                Event::TaskResult(result) => result??,
+            }
+        }
+        Ok(())
+    }
+}
+
+struct PlainPrefetch {
+    db: Arc<DB>,
+
+    rx_op: Receiver<(StorageKey, oneshot::Sender<Option<Bytes>>)>,
+
+    tasks: JoinSet<anyhow::Result<()>>,
+}
+
+impl PlainPrefetch {
+    pub fn new(db: Arc<DB>, rx_op: Receiver<(StorageKey, oneshot::Sender<Option<Bytes>>)>) -> Self {
+        Self {
+            db,
+            rx_op,
+            tasks: JoinSet::new(),
+        }
+    }
+
+    pub async fn run(mut self, cancel: CancellationToken) -> anyhow::Result<()> {
+        cancel
+            .run_until_cancelled(self.run_inner())
+            .await
+            .unwrap_or(Ok(()))?;
+        self.tasks.shutdown().await;
+        Ok(())
+    }
+
+    async fn run_inner(&mut self) -> anyhow::Result<()> {
+        loop {
+            enum Event<R> {
+                Op((StorageKey, oneshot::Sender<Option<Bytes>>)),
+                TaskResult(R),
+            }
+            match select! {
+                Some(op) = self.rx_op.recv() => Event::Op(op),
+                Some(res) = self.tasks.join_next() => Event::TaskResult(res),
+                else => break,
+            } {
+                Event::Op((storage_key, tx_value)) => {
+                    let db = self.db.clone();
+                    self.tasks.spawn_blocking(move || {
+                        let value = db.get(storage_key.0)?;
+                        let _ = tx_value.send(value.map(Into::into));
+                        anyhow::Ok(())
+                    });
+                }
                 Event::TaskResult(result) => result??,
             }
         }

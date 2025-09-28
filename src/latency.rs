@@ -16,9 +16,9 @@ impl Deref for Latency {
     }
 }
 
-impl AddAssign<u64> for Latency {
-    fn add_assign(&mut self, rhs: u64) {
-        self.0 += rhs
+impl AddAssign<Duration> for Latency {
+    fn add_assign(&mut self, rhs: Duration) {
+        self.0 += rhs.as_nanos() as u64
     }
 }
 

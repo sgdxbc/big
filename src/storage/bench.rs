@@ -122,7 +122,7 @@ impl Display for BenchLatencies {
         writeln!(f, "command: {}", self.command)?;
         writeln!(f, "fetch_sync: {}", self.fetch_sync)?;
         writeln!(f, "fetch: {}", self.fetch)?;
-        writeln!(f, "bump: {}", self.bump)
+        write!(f, "bump: {}", self.bump)
     }
 }
 
@@ -181,9 +181,10 @@ impl Bench {
                     break;
                 };
                 record.stop();
-                self.latencies.fetch += fetch_latency.as_nanos() as u64
+                self.latencies.fetch += fetch_latency
             }
-            let start = Instant::now();
+
+            let record = self.latencies.bump.record();
             let (tx_ok, rx_ok) = oneshot::channel();
             let _ = self
                 .tx_op
@@ -192,8 +193,8 @@ impl Bench {
             let Ok(()) = rx_ok.await else {
                 break;
             };
-            self.latencies.bump += start.elapsed().as_nanos() as u64;
-            self.latencies.command += command.start.elapsed().as_nanos() as u64;
+            record.stop();
+            self.latencies.command += command.start.elapsed();
 
             let now = Instant::now();
             let elapsed = now.duration_since(interval_start);

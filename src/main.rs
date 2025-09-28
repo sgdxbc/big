@@ -110,7 +110,7 @@ async fn role_bench(configs: Configs, index: u16) -> anyhow::Result<()> {
     //     rocksdb::Cache::new_lru_cache(512 << 20),
     // )?;
     options.enable_statistics();
-    options.increase_parallelism(std::thread::available_parallelism()?.get() as _);
+    // options.increase_parallelism(std::thread::available_parallelism()?.get() as _);
     // let mut block_based_options = BlockBasedOptions::default();
     // block_based_options.set_block_cache(&Cache::new_lru_cache(6 << 30));
     // options.set_block_based_table_factory(&block_based_options);
