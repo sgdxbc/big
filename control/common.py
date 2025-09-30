@@ -7,7 +7,6 @@ build_dir = "/tmp/bftk"
 deploy_dir = "/app"
 nfs = False
 terraform = False
-login_key = None
 
 
 class Task:
