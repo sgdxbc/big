@@ -57,15 +57,31 @@ impl AsRef<[u8]> for StorageKey {
     }
 }
 
+pub enum StorageOp2 {
+    Fetch(StorageKey, oneshot::Sender<Option<Bytes>>),
+    Bump(BumpUpdates, oneshot::Sender<()>),
+}
+
+pub struct StorageFacade {
+    rx_op: Receiver<StorageOp2>,
+    tx_fetch: flume::Sender<(StorageKey, oneshot::Sender<Option<Bytes>>)>,
+    tx_bump: flume::Sender<Vec<(StorageKey, Option<Bytes>)>>,
+    rx_bump_done: Receiver<usize>,
+
+    tracked: HashMap<StorageKey, Tracked>,
+}
+
+enum Tracked {
+    Fetching(oneshot::Sender<Option<Bytes>>),
+    Updated(StateVersion, Option<Bytes>),
+}
+
 pub type StateVersion = u64;
 
 type BumpUpdates = Vec<(StorageKey, Option<Bytes>)>;
 
 pub enum StorageOp {
     Fetch(StorageKey, oneshot::Sender<Option<Bytes>>),
-    // technically Bump does not require a result channel; if back pressure is demanded, simply not
-    // receiving the next op will do. the result channel is currently for measuring latency in the
-    // benchmark
     Bump(BumpUpdates, oneshot::Sender<()>),
 
     VoteArchive(NodeIndex, ArchiveRound),

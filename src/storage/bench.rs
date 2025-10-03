@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     fmt::Display,
     mem::replace,
     net::SocketAddr,
@@ -34,6 +35,96 @@ pub struct BenchConfig {
     put_ratio: f64,
     prefetch_offset: StateVersion,
 }
+
+pub struct Bench2 {
+    config: BenchConfig,
+
+    tx_fetch: flume::Sender<(StorageKey, oneshot::Sender<Option<Bytes>>)>,
+    tx_bump: flume::Sender<Vec<(StorageKey, Option<Bytes>)>>,
+    rx_bump_done: Receiver<usize>,
+
+    rng: StdRng,
+    inflight: VecDeque<Inflight>,
+}
+
+struct Inflight {
+    start: Instant,
+    rx_value: Option<oneshot::Receiver<Option<Bytes>>>,
+}
+
+impl Bench2 {
+    pub fn new(
+        config: BenchConfig,
+        tx_fetch: flume::Sender<(StorageKey, oneshot::Sender<Option<Bytes>>)>,
+        tx_bump: flume::Sender<Vec<(StorageKey, Option<Bytes>)>>,
+        rx_bump_done: Receiver<usize>,
+    ) -> Self {
+        Self {
+            config,
+            tx_fetch,
+            tx_bump,
+            rx_bump_done,
+            rng: StdRng::seed_from_u64(117418),
+            inflight: Default::default(),
+        }
+    }
+
+    pub async fn run(mut self, cancel: CancellationToken) -> anyhow::Result<()> {
+        let start = Instant::now();
+        cancel
+            .run_until_cancelled(self.run_inner())
+            .await
+            .unwrap_or(Ok(()))?;
+        //
+        Ok(())
+    }
+
+    async fn run_inner(&mut self) -> anyhow::Result<()> {
+        for _ in 0..self.config.prefetch_offset {
+            self.push_inflight()
+        }
+        let mut value = vec![0; 68];
+        loop {
+            let Some(inflight) = self.inflight.pop_front() else {
+                unreachable!()
+            };
+            let updates = if let Some(rx_value) = inflight.rx_value {
+                let Ok(_) = rx_value.await else {
+                    break;
+                };
+                Default::default()
+            } else {
+                let key = Self::uniform_key(self.rng.random_range(0..self.config.num_key));
+                self.rng.fill(&mut value[..]);
+                vec![(key, Some(value.clone().into()))]
+            };
+            self.tx_bump.send_async(updates).await?;
+
+            self.push_inflight()
+        }
+        Ok(())
+    }
+
+    fn push_inflight(&mut self) {
+        let start = Instant::now();
+        let rx_value = if self.rng.random_bool(self.config.put_ratio) {
+            None
+        } else {
+            let (tx_value, rx_value) = oneshot::channel();
+            let key = Self::uniform_key(self.rng.random_range(0..self.config.num_key));
+            let result = self.tx_fetch.try_send((key, tx_value));
+            assert!(!matches!(result, Err(flume::TrySendError::Full(_))));
+            Some(rx_value)
+        };
+        self.inflight.push_back(Inflight { start, rx_value })
+    }
+
+    fn uniform_key(index: u64) -> StorageKey {
+        StorageKey(StdRng::seed_from_u64(index).random())
+    }
+}
+
+// struct Bench
 
 struct BenchProduce {
     config: BenchConfig,
