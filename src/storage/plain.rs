@@ -17,26 +17,6 @@ use crate::{db::DbWorker, latency::Latency};
 
 use super::{StorageKey, StorageOp};
 
-pub struct PlainStorage2 {
-    db_worker: DbWorker,
-}
-
-impl PlainStorage2 {
-    pub fn new(
-        db: Arc<DB>,
-        rx_fetch: flume::Receiver<(StorageKey, oneshot::Sender<Option<Bytes>>)>,
-        rx_bump: flume::Receiver<Vec<(StorageKey, Option<Bytes>)>>,
-        tx_bump_done: Sender<usize>,
-    ) -> Self {
-        let db_worker = DbWorker::new(db, 50, rx_fetch, rx_bump, tx_bump_done);
-        Self { db_worker }
-    }
-
-    pub async fn run(self, cancel: CancellationToken) -> anyhow::Result<()> {
-        self.db_worker.run(cancel).await
-    }
-}
-
 pub enum PlainStorage {
     Sync(PlainSyncStorage),
     Prefetch(PlainPrefetchStorage),

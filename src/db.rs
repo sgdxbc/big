@@ -14,7 +14,7 @@ use tokio::sync::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::storage::StorageKey;
+use crate::storage2::StorageKey;
 
 struct StopGuard(Sender<()>);
 
@@ -51,8 +51,11 @@ impl GetWorker {
 struct WriteWorker {
     db: Arc<DB>,
 
+    // cannot use tokio channel because it does not support timeout on blocking interfaces
+    // prefer flume over std just because we are already using flume channels. three different
+    // kinds of channels in a module is too much
     rx: flume::Receiver<Vec<(StorageKey, Option<Bytes>)>>,
-    tx: Sender<usize>,
+    tx: Sender<u64>,
     running: Arc<AtomicBool>,
     _stop_guard: StopGuard,
 }
@@ -99,7 +102,7 @@ impl DbWorker {
         num_get_worker: u32,
         rx_get: flume::Receiver<(StorageKey, oneshot::Sender<Option<Bytes>>)>,
         rx_write: flume::Receiver<Vec<(StorageKey, Option<Bytes>)>>,
-        tx_write_done: Sender<usize>,
+        tx_write_done: Sender<u64>,
     ) -> Self {
         let running = Arc::new(AtomicBool::new(true));
         let (tx_stopped, rx_stopped) = channel(1);
