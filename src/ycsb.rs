@@ -10,7 +10,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::storage2::{BumpUpdates, StorageKey, StorageSchedOp};
+use crate::storage2::{BumpUpdates, StorageKey, StorageOp};
 
 #[derive(Debug, Encode, Decode)]
 pub enum YcsbOp {
@@ -61,7 +61,7 @@ impl YcsbExecute {
 
 struct YcsbFront {
     rx_op: Receiver<(YcsbOp, oneshot::Sender<YcsbRes>)>,
-    tx_storage_sched: Sender<StorageSchedOp>,
+    tx_storage: Sender<StorageOp>,
     tx_inflight: Sender<(oneshot::Sender<YcsbRes>, InflightData)>,
     rx_bump: Receiver<BumpUpdates>,
 
@@ -85,8 +85,8 @@ impl YcsbFront {
                         YcsbOp::Read(key) => {
                             let (tx_fetch, rx_fetch) = oneshot::channel();
                             let _ = self
-                                .tx_storage_sched
-                                .send(StorageSchedOp::FetchAhead(
+                                .tx_storage
+                                .send(StorageOp::FetchAhead(
                                     StorageKey::digest(key),
                                     self.num_inflight,
                                     tx_fetch,
@@ -100,10 +100,7 @@ impl YcsbFront {
                     self.num_inflight += 1
                 }
                 Event::Bump(updates) => {
-                    let _ = self
-                        .tx_storage_sched
-                        .send(StorageSchedOp::Bump(updates))
-                        .await;
+                    let _ = self.tx_storage.send(StorageOp::Bump(updates)).await;
                     self.num_inflight -= 1
                 }
             }
@@ -115,14 +112,14 @@ impl YcsbFront {
 impl Ycsb {
     pub fn new(
         rx_op: Receiver<(YcsbOp, oneshot::Sender<YcsbRes>)>,
-        tx_storage_sched: Sender<StorageSchedOp>,
+        tx_storage_sched: Sender<StorageOp>,
     ) -> Self {
         let (tx_inflight, rx_inflight) = channel(100);
         let (tx_bump, rx_bump) = channel(100);
         Self {
             front: YcsbFront {
                 rx_op,
-                tx_storage_sched,
+                tx_storage: tx_storage_sched,
                 tx_inflight,
                 rx_bump,
                 num_inflight: 0,

@@ -33,7 +33,7 @@ impl AsRef<[u8]> for StorageKey {
     }
 }
 
-pub enum StorageSchedOp {
+pub enum StorageOp {
     FetchAhead(StorageKey, StateVersion, oneshot::Sender<Option<Bytes>>),
     Bump(BumpUpdates),
 }
@@ -42,7 +42,7 @@ type StateVersion = u64;
 
 pub type BumpUpdates = Vec<(StorageKey, Option<Bytes>)>;
 
-pub enum StorageOp {
+pub enum StorageRawOp {
     Fetch(StorageKey, oneshot::Sender<Option<Bytes>>),
     Bump(BumpUpdates),
 }

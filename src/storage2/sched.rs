@@ -13,11 +13,11 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::{StateVersion, StorageKey, StorageOp, StorageSchedOp};
+use super::{StateVersion, StorageKey, StorageRawOp, StorageOp};
 
 pub struct StorageSched {
-    rx_op: Receiver<StorageSchedOp>,
-    tx_op: Sender<StorageOp>,
+    rx_op: Receiver<StorageOp>,
+    tx_op: Sender<StorageRawOp>,
     rx_bumped: Receiver<StateVersion>,
 
     version: StateVersion, // according to the number of received Bump
@@ -35,8 +35,8 @@ struct FetchAheadState {
 
 impl StorageSched {
     pub fn new(
-        rx_op: Receiver<StorageSchedOp>,
-        tx_op: Sender<StorageOp>,
+        rx_op: Receiver<StorageOp>,
+        tx_op: Sender<StorageRawOp>,
         rx_bumped: Receiver<StateVersion>,
     ) -> Self {
         Self {
@@ -61,7 +61,7 @@ impl StorageSched {
     async fn run_inner(&mut self) -> anyhow::Result<()> {
         loop {
             enum Event {
-                Op(StorageSchedOp),
+                Op(StorageOp),
                 Bumped(StateVersion),
             }
             match select! {
@@ -92,11 +92,11 @@ impl StorageSched {
         Ok(())
     }
 
-    async fn handle_op(&mut self, op: StorageSchedOp) {
+    async fn handle_op(&mut self, op: StorageOp) {
         match op {
-            StorageSchedOp::FetchAhead(key, version_ahead, tx) => {
+            StorageOp::FetchAhead(key, version_ahead, tx) => {
                 let (tx_value, rx_value) = oneshot::channel();
-                let _ = self.tx_op.send(StorageOp::Fetch(key, tx_value)).await;
+                let _ = self.tx_op.send(StorageRawOp::Fetch(key, tx_value)).await;
                 let state = FetchAheadState {
                     key,
                     tx,
@@ -108,14 +108,14 @@ impl StorageSched {
                     .push(state);
                 self.finalize_fetch()
             }
-            StorageSchedOp::Bump(updates) => {
+            StorageOp::Bump(updates) => {
                 self.version += 1;
                 for (key, value) in &updates {
                     self.updates.insert(*key, (self.version, value.clone()));
                     self.update_queue.push(Reverse((self.version, *key)))
                 }
                 self.finalize_fetch();
-                let _ = self.tx_op.send(StorageOp::Bump(updates)).await;
+                let _ = self.tx_op.send(StorageRawOp::Bump(updates)).await;
             }
         }
     }

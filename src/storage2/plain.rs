@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::db::DbWorker;
 
-use super::{StorageKey, StorageOp, StorageSchedOp, sched::StorageSched};
+use super::{StorageKey, StorageRawOp, StorageOp, sched::StorageSched};
 
 pub struct PlainStorage {
     sched: StorageSched,
@@ -22,7 +22,7 @@ pub struct PlainStorage {
 }
 
 struct Dispatch {
-    rx_op: Receiver<StorageOp>,
+    rx_op: Receiver<StorageRawOp>,
     tx_get: flume::Sender<(StorageKey, oneshot::Sender<Option<Bytes>>)>,
     tx_write: flume::Sender<Vec<(StorageKey, Option<Bytes>)>>,
 }
@@ -31,10 +31,10 @@ impl Dispatch {
     async fn run(&mut self) -> anyhow::Result<()> {
         while let Some(op) = self.rx_op.recv().await {
             match op {
-                StorageOp::Fetch(key, tx) => {
+                StorageRawOp::Fetch(key, tx) => {
                     let _ = self.tx_get.send((key, tx));
                 }
-                StorageOp::Bump(updates) => {
+                StorageRawOp::Bump(updates) => {
                     let _ = self.tx_write.send(updates);
                 }
             }
@@ -44,7 +44,7 @@ impl Dispatch {
 }
 
 impl PlainStorage {
-    pub fn new(db: Arc<DB>, rx_sched_op: Receiver<StorageSchedOp>) -> Self {
+    pub fn new(db: Arc<DB>, rx_sched_op: Receiver<StorageOp>) -> Self {
         let (tx_op, rx_op) = channel(100);
         let (tx_bumped, rx_bumped) = channel(100);
         let (tx_get, rx_get) = flume::bounded(100);
